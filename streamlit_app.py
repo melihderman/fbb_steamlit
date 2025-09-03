@@ -296,7 +296,7 @@ if st.sidebar.button("Run Simulation"):
     all_meetingrooms = build_room_occupancy_slots(
         all_meetings,
         slot_times=TIMES_DAY,
-        by=("replication", "date", "meeting_room_size"),
+        by=("replication", "weekNumber", "date", "meeting_room_size"),
         room_col="room_id",
         include_idle=True,
     )
