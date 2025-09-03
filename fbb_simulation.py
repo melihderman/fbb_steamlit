@@ -570,9 +570,10 @@ def build_room_occupancy_slots(
     slot_len = float(np.median(np.diff(slot_times))) if n_slots > 1 else 0.5
 
     # Group factorization to integer codes
-    grp_vals = [df[k].to_numpy() for k in by]
-    grp_codes, grp_uniques = pd.factorize(list(zip(*grp_vals)), sort=False)
-    G = int(grp_uniques.size)
+    grp_vals = [df[k].to_numpy(copy=False) for k in by]
+    mi = pd.MultiIndex.from_arrays(grp_vals, names=by)
+    grp_codes, grp_uniques = pd.factorize(mi, sort=False)
+    G = len(grp_uniques)
 
     # Convert times to slot indices
     start_arr = df["start_time"].to_numpy(float)
@@ -1354,7 +1355,7 @@ if __name__ == "__main__":
         weeks_not_working=7,
         iterations=20,
         seed=42,
-        min_cleardesk_hours=1.5,
+        min_cleardesk_hours=15,
         meeting_room_max_size=meeting_room_max_size,
         week_weighting=week_weighting,
         meeting_size_dist=meeting_size_dist,
@@ -1373,7 +1374,7 @@ if __name__ == "__main__":
     plot_tagespeak(all_data).show()
     plot_meetingrooms(all_meetingrooms, "klein").show()
     plot_meetingrooms(all_meetingrooms, "mittel").show()
-    plot_meetingrooms(all_meetingrooms, "gross")
+    plot_meetingrooms(all_meetingrooms, "gross").show()
 
     print("\nBG pro Einheit:")
     bg_rep_mean = all_data.groupby(["replication", "unit"], observed=False)["bg"].mean()
@@ -1433,4 +1434,4 @@ if __name__ == "__main__":
         actual_pct = present_pct.get(w, 0.0)
         print(f"Woche {w}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
 
-    # input("\nFertig. Enter zum Beenden...")
+    input("\nFertig. Enter zum Beenden...")
