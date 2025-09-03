@@ -350,6 +350,7 @@ def _assign_meetings_numpy(
                 int(next_meeting_id),
                 unit,
                 date_ts,
+                int(date_ts.isocalendar().week),
                 int(size),
                 float(dur),
                 float(ph),
@@ -755,49 +756,6 @@ def run_simulation(
         week_weights = np.ones(len(weeks), dtype=float)
     week_weights = week_weights / week_weights.sum()
 
-    # Defaults for meeting params
-    if meeting_room_max_size is None:
-        meeting_room_max_size = {"klein": 4, "mittel": 8, "gross": 20}
-    if meeting_size_dist is None:
-        meeting_size_dist = {
-            2: 0.7,
-            3: 0.15,
-            4: 0.05,
-            5: 0.04,
-            6: 0.03,
-            7: 0.02,
-            8: 0.01,
-        }
-    if meeting_duration_dist is None:
-        meeting_duration_dist = {
-            0.5: 0.1,
-            1.0: 0.7,
-            1.5: 0.05,
-            2.0: 0.1,
-            3.0: 0.03,
-            4.0: 0.02,
-        }
-    if meeting_start_time_dist is None:
-        meeting_start_time_dist = {
-            8.0: 0.1,
-            8.5: 0.05,
-            9.0: 0.1,
-            9.5: 0.05,
-            10.0: 0.1,
-            10.5: 0.05,
-            11.0: 0.1,
-            11.5: 0.0,
-            12.0: 0.0,
-            12.5: 0.0,
-            13.0: 0.1,
-            13.5: 0.05,
-            14.0: 0.1,
-            14.5: 0.05,
-            15.0: 0.1,
-            15.5: 0.03,
-            16.0: 0.02,
-        }
-
     def _prep_dist(
         d: Mapping[float, float], dtype=float
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1049,6 +1007,7 @@ def run_simulation(
             "meeting_id",
             "unit",
             "date",
+            "weekNumber",
             "size",
             "duration",
             "person_hours",
@@ -1077,13 +1036,25 @@ import matplotlib.pyplot as plt
 def plot_tagespeak(all_data: pd.DataFrame):
     """Visualisierung wie im Beispielbild: Anzahl APs für verschiedene Quantile."""
 
+    # group = (
+    #     all_data.groupby(["replication", "date", "time_float"])["einzel_ap"]
+    #     .sum()
+    #     .groupby(["replication", "date"])
+    # )
+    # daily_peaks = group.max()  # Tagespeak je Replication & Datum
+    # avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
     group = (
-        all_data.groupby(["replication", "date", "time_float"])["einzel_ap"]
+        all_data.groupby(["replication", "weekNumber", "date", "time_float"])[
+            "einzel_ap"
+        ]
         .sum()
-        .groupby(["replication", "date"])
+        .groupby(["replication", "weekNumber", "date"])
     )
+
     daily_peaks = group.max()  # Tagespeak je Replication & Datum
-    avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
+    avg_peaks_per_rep = daily_peaks.groupby(
+        ["replication", "weekNumber"]
+    ).mean()  # Durchschnittlicher Tagespeak je Replication
 
     # 3. Quantile (100% .. 5%)
     quantile_levels = np.arange(0.0, 1.0, 0.05) + 0.05
@@ -1145,17 +1116,30 @@ def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
         print(f"Keine Daten für {size} Meetingräume.")
         return
 
+    # group = (
+    #     df.groupby(["replication", "date", "time_float"])["busy"]
+    #     .sum()
+    #     .groupby(["replication", "date"])
+    # )
+
+    # # 1. Tagespeak je Replication & Datum & Slot
+    # daily_peaks = group.max()  # Tagespeak je Replication & Datum
+
+    # # 2. Durchschnittlicher Tagespeak pro Simulation
+    # avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
     group = (
-        df.groupby(["replication", "date", "time_float"])["busy"]
+        df.groupby(["replication", "weekNumber", "date", "time_float"])["busy"]
         .sum()
-        .groupby(["replication", "date"])
+        .groupby(["replication", "weekNumber", "date"])
     )
 
     # 1. Tagespeak je Replication & Datum & Slot
     daily_peaks = group.max()  # Tagespeak je Replication & Datum
 
     # 2. Durchschnittlicher Tagespeak pro Simulation
-    avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
+    avg_peaks_per_rep = daily_peaks.groupby(
+        ["replication", "weekNumber"]
+    ).mean()  # Durchschnittlicher Tagespeak je Replication
 
     # 3. Quantile (100% .. 5%) runden auf 2 stellige Zahl
     quantile_levels = np.arange(0.0, 1.0, 0.05) + 0.05
@@ -1381,7 +1365,7 @@ if __name__ == "__main__":
     all_meetingrooms = build_room_occupancy_slots(
         all_meetings,
         slot_times=TIMES_DAY,
-        by=("replication", "date", "meeting_room_size"),
+        by=("replication", "weekNumber", "date", "meeting_room_size"),
         room_col="room_id",
         include_idle=True,
     )
@@ -1389,7 +1373,7 @@ if __name__ == "__main__":
     plot_tagespeak(all_data).show()
     plot_meetingrooms(all_meetingrooms, "klein").show()
     plot_meetingrooms(all_meetingrooms, "mittel").show()
-    # plot_meetingrooms(all_meetingrooms, "gross")
+    plot_meetingrooms(all_meetingrooms, "gross")
 
     print("\nBG pro Einheit:")
     bg_rep_mean = all_data.groupby(["replication", "unit"], observed=False)["bg"].mean()
@@ -1449,4 +1433,4 @@ if __name__ == "__main__":
         actual_pct = present_pct.get(w, 0.0)
         print(f"Woche {w}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
 
-    input("\nFertig. Enter zum Beenden...")
+    # input("\nFertig. Enter zum Beenden...")
