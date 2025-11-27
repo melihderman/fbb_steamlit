@@ -7,6 +7,7 @@ from typing import Dict, List, Mapping, Optional, Tuple, Iterable
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import heapq
 
 # -------------------------------------------------
@@ -40,7 +41,8 @@ DAY_CODES = np.array(["mon", "tue", "wed", "thu", "fri"], dtype=object)
 SLOTS_AM = np.arange(8.0, 12.5, 0.5)
 SLOTS_PM = np.arange(12.5, 17.0, 0.5)
 TIMES_DAY = np.concatenate([SLOTS_AM, SLOTS_PM])
-
+SHARING_FACTOR = 0.8
+CUT_OFF_QUANTILE = 0.2  # (ohne die 20% tiefsten Peaks)
 
 # -------------------------------------------------
 # Calendar & setup
@@ -242,6 +244,117 @@ def build_category_mask_vectorized(
     logp[pos] = np.log(halfday_probs[pos])
     scores = logp[None, :] + rng.gumbel(size=(num_employees, n_cats))
     return _topk_mask_per_row(scores, k_per_row)
+
+
+# -------------------------------------------------
+# Presence balancing (weeks & categories) — optimized
+# -------------------------------------------------
+
+
+def adjust_presence_to_targets(
+    present_half: np.ndarray,
+    *,
+    week_weights: np.ndarray,
+    total_slots_unit: int,
+    office_share: float,
+    rate_variability: float,
+    slot_weeknums_half: np.ndarray,
+    slot_cat_idx_half: np.ndarray,
+    targets: np.ndarray,
+    rng: np.random.Generator,
+    max_iter: int = 10,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """
+    Balanciert `present_half` (E x 2D, bool) gegen Wochen- & Kategorienziele mit Toleranzen.
+
+    *Wichtig:* `slot_weeknums_half` muss 0..(n_weeks-1) kodieren (kein ISO direkt).
+    """
+    if present_half.dtype != np.bool_:
+        raise ValueError("present_half muss bool dtype haben.")
+
+    n_weeks = int(len(week_weights))
+    n_cats = int(targets.size)
+
+    week_targets = np.rint(
+        week_weights * float(total_slots_unit) * float(office_share)
+    ).astype(np.int32)
+    week_tolerance = (week_targets * float(rate_variability)).astype(np.int32)
+    halfday_tolerance = (targets * float(rate_variability)).astype(np.int32)
+
+    week_of_col = slot_weeknums_half.astype(np.int32, copy=False)
+    cat_of_col = slot_cat_idx_half.astype(np.int32, copy=False)
+
+    def _counts(present: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        per_half = present.sum(axis=0).astype(np.int32, copy=False)
+        per_week = np.bincount(week_of_col, weights=per_half, minlength=n_weeks).astype(
+            np.int32, copy=False
+        )
+        per_cat = np.bincount(cat_of_col, weights=per_half, minlength=n_cats).astype(
+            np.int32, copy=False
+        )
+        return per_half, per_week, per_cat
+
+    def _trim_by_group(
+        present: np.ndarray,
+        group_of_col: np.ndarray,
+        extras: np.ndarray,
+        tolerance: np.ndarray,
+    ) -> int:
+        rows, cols = present.nonzero()
+        groups_to_trim = np.flatnonzero(extras > tolerance)
+        removed_total = 0
+        if groups_to_trim.size == 0 or rows.size == 0:
+            return 0
+
+        col_groups = group_of_col[cols]
+
+        for g in groups_to_trim:
+            idxs = np.flatnonzero(col_groups == g)
+            if idxs.size == 0:
+                continue
+            n_remove = int(min(int(extras[g]), idxs.size))
+            if n_remove <= 0:
+                continue
+            pick_local = rng.choice(idxs.size, size=n_remove, replace=False)
+            sel = idxs[pick_local]
+            r = rows[sel]
+            c = cols[sel]
+            # Warum inplace? Vermeidet Allokationen
+            present[r, c] = False
+            removed_total += n_remove
+        return removed_total
+
+    for _ in range(int(max_iter)):
+        per_half, per_week, per_cat = _counts(present_half)
+
+        extra_week = per_week - week_targets
+        removed_w = _trim_by_group(
+            present_half, week_of_col, extra_week, week_tolerance
+        )
+        if removed_w:
+            per_half, per_week, per_cat = _counts(present_half)
+
+        extra_cat = per_cat - targets.astype(np.int32, copy=False)
+        removed_c = _trim_by_group(
+            present_half, cat_of_col, extra_cat, halfday_tolerance
+        )
+        if removed_c:
+            per_half, per_week, per_cat = _counts(present_half)
+
+        if np.all(np.abs(per_week - week_targets) <= week_tolerance) and np.all(
+            np.abs(per_cat - targets) <= halfday_tolerance
+        ):
+            break
+
+    metrics = {
+        "week_targets": week_targets,
+        "week_tolerance": week_tolerance,
+        "halfday_tolerance": halfday_tolerance,
+        "present_sum_per_half": per_half,
+        "present_sum_per_week": per_week,
+        "counts_by_cat": per_cat,
+    }
+    return present_half, metrics
 
 
 # -------------------------------------------------
@@ -462,10 +575,11 @@ def compute_required_rooms(
 
     df = all_meetings.loc[:, list(by) + ["start_time", "end_time"]].copy()
 
-    # Factorize tuple key for vectorized accumulation
-    grp_vals = [df[k].to_numpy() for k in by]
-    grp_codes, grp_uniques = pd.factorize(list(zip(*grp_vals)), sort=False)
-    G = int(grp_uniques.size)
+    # Group factorization to integer codes
+    grp_vals = [df[k].to_numpy(copy=False) for k in by]
+    mi = pd.MultiIndex.from_arrays(grp_vals, names=by)
+    grp_codes, grp_uniques = pd.factorize(mi, sort=False)
+    G = len(grp_uniques)
 
     # Slot grid & length
     slot_times = np.asarray(slot_times, dtype=float)
@@ -522,7 +636,7 @@ def build_room_occupancy_slots(
     all_meetings: pd.DataFrame,
     *,
     slot_times: np.ndarray = TIMES_DAY,
-    by: Tuple[str, ...] = ("replication", "unit", "date", "meeting_room_size"),
+    by: Tuple[str, ...] = ("replication", "weekNumber", "date", "meeting_room_size"),
     room_col: str = "room_id",
     include_idle: bool = False,
 ) -> pd.DataFrame:
@@ -590,7 +704,7 @@ def build_room_occupancy_slots(
     grp_sorted = grp_codes[order]
     s_sorted = s_idx[order]
     e_sorted = e_idx[order]
-    mid_sorted = df["meeting_id"].to_numpy()[order]
+    # mid_sorted = df["meeting_id"].to_numpy()[order]
 
     # boundaries of groups in sorted order
     bounds = np.flatnonzero(np.r_[True, grp_sorted[1:] != grp_sorted[:-1], True])
@@ -719,7 +833,7 @@ def run_simulation(
     *,
     start_date: date,
     end_date: date,
-    week_factor: Dict[str, float],
+    # week_factor: Dict[str, float],
     profiles: Dict[str, Dict[str, float]],
     min_bg: float = 0.4,
     max_bg: float = 1.0,
@@ -738,10 +852,10 @@ def run_simulation(
     """Run full simulation in NumPy; create pandas DataFrames once at the end."""
     rng = np.random.default_rng(seed)
 
-    # Calendar & categories
-    cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
-        start_date, end_date, week_factor
-    )
+    # # Calendar & categories
+    # cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
+    #     start_date, end_date, week_factor
+    # )
 
     # Week weights from mapping (normalize over weeks present)
     weeks = pd.date_range(start=start_date, end=end_date, freq="W-MON")
@@ -798,6 +912,11 @@ def run_simulation(
             target_rate = float(profile["employment_rate"])  # type: ignore[index]
             office_share = float(profile["office"])  # type: ignore[index]
             meeting_ratio_center = float(profile["meeting"])  # type: ignore[index]
+            week_factor = profile.get("week_factor", {})
+            # Calendar & categories
+            cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
+                start_date, end_date, week_factor
+            )
 
             bgs = draw_bgs(
                 rng,
@@ -836,24 +955,27 @@ def run_simulation(
                 int
             )
 
-            present_sum_per_half = present_half.sum(axis=0).astype(int)
-            counts_by_cat = np.bincount(
-                cal.slot_cat_idx_half, weights=present_sum_per_half, minlength=n_cats
-            ).astype(int)
+            # --- Optimiertes Balancing: Wochen & Kategorien mit Toleranzen ---
+            # ISO-Woche → Positionsindex im aktuellen Zeitraum
+            remap = np.full(54, -1, dtype=np.int32)
+            remap[iso_weeks] = np.arange(len(iso_weeks), dtype=np.int32)
+            week_idx_half = remap[cal.slot_weeknums_half]
+            if np.any(week_idx_half < 0):
+                # Sollte nicht passieren; defensiv auf 0 setzen
+                week_idx_half = np.where(week_idx_half < 0, 0, week_idx_half)
 
-            for c in range(n_cats):
-                extra = counts_by_cat[c] - targets[c]
-                if extra <= 0:
-                    continue
-                half_idxs_c = np.flatnonzero(cal.slot_cat_idx_half == c)
-                sub = present_half[:, half_idxs_c]
-                emp_rel_idx = np.flatnonzero(sub)
-                if emp_rel_idx.size == 0:
-                    continue
-                n_remove = int(min(extra, emp_rel_idx.size))
-                pick = rng.choice(emp_rel_idx.size, size=n_remove, replace=False)
-                emp_idx, half_rel = np.unravel_index(emp_rel_idx[pick], sub.shape)
-                present_half[emp_idx, half_idxs_c[half_rel]] = False
+            present_half, _metrics = adjust_presence_to_targets(
+                present_half,
+                week_weights=week_weights,
+                total_slots_unit=total_slots_unit,
+                office_share=office_share,
+                rate_variability=employment_rate_variability,
+                slot_weeknums_half=week_idx_half,  # 0..n_weeks-1
+                slot_cat_idx_half=cal.slot_cat_idx_half,
+                targets=targets,
+                rng=rng,
+                max_iter=10,
+            )
 
             E, twoD = present_half.shape
             D = cal.n_days
@@ -1029,21 +1151,15 @@ def run_simulation(
 # Plots
 # -------------------------------------------------
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 
-
-def plot_tagespeak(all_data: pd.DataFrame):
+def plot_tagespeak(
+    all_data: pd.DataFrame,
+    total_employees: int,
+    cut_off_quantile: float = CUT_OFF_QUANTILE,
+    sharing_factor: float = SHARING_FACTOR,
+):
     """Visualisierung wie im Beispielbild: Anzahl APs für verschiedene Quantile."""
 
-    # group = (
-    #     all_data.groupby(["replication", "date", "time_float"])["einzel_ap"]
-    #     .sum()
-    #     .groupby(["replication", "date"])
-    # )
-    # daily_peaks = group.max()  # Tagespeak je Replication & Datum
-    # avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
     group = (
         all_data.groupby(["replication", "weekNumber", "date", "time_float"])[
             "einzel_ap"
@@ -1053,6 +1169,12 @@ def plot_tagespeak(all_data: pd.DataFrame):
     )
 
     daily_peaks = group.max()  # Tagespeak je Replication & Datum
+    # daily_peaks.to_excel("daily_peaks.xlsx")
+    # tiefsten 20 % abschneiden
+    daily_peaks = daily_peaks.groupby(["replication", "weekNumber"]).apply(
+        lambda df: df[df >= df.quantile(cut_off_quantile)]
+    )
+    # daily_peaks.to_excel("daily_peaks_cut.xlsx")
     avg_peaks_per_rep = daily_peaks.groupby(
         ["replication", "weekNumber"]
     ).mean()  # Durchschnittlicher Tagespeak je Replication
@@ -1062,6 +1184,8 @@ def plot_tagespeak(all_data: pd.DataFrame):
     quantiles = np.quantile(avg_peaks_per_rep, q=quantile_levels)
 
     # 4. Zusatzlinien
+    # Anzahl StandardAP bzw. EinzelAp mit Sharing-Faktor
+    total_standap = total_employees * sharing_factor
     max_daily_peak = daily_peaks.max()
     max_avg_peak = avg_peaks_per_rep.max()
     mean_avg_peak = avg_peaks_per_rep.median()
@@ -1084,16 +1208,24 @@ def plot_tagespeak(all_data: pd.DataFrame):
             va="bottom",
         )
 
-    ax.axhline(max_daily_peak, color="orange", linewidth=2, label="Maximaler Tagespeak")
+    ax.axhline(
+        total_standap,
+        color="#fa0505",
+        linewidth=2,
+        label=f"Anzahl StandardAP bzw. EinzelAP mit Sharing-Ratio {sharing_factor}",
+    )
+    ax.axhline(
+        max_daily_peak, color="#fa7f05", linewidth=2, label="Maximaler Tagespeak"
+    )
     ax.axhline(
         max_avg_peak,
-        color="darkgreen",
+        color="#1d5706",
         linewidth=2,
         label="Max. durchschnittlicher Tagespeak",
     )
     ax.axhline(
         mean_avg_peak,
-        color="green",
+        color="#ACE60D",
         linewidth=2,
         label="Median durchschnittlicher Tagespeak",
     )
@@ -1166,16 +1298,18 @@ def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
             va="bottom",
         )
 
-    ax.axhline(max_daily_peak, color="orange", linewidth=2, label="Maximaler Tagespeak")
+    ax.axhline(
+        max_daily_peak, color="#fa7f05", linewidth=2, label="Maximaler Tagespeak"
+    )
     ax.axhline(
         max_avg_peak,
-        color="darkgreen",
+        color="#1d5706",
         linewidth=2,
         label="Max. durchschnittlicher Tagespeak",
     )
     ax.axhline(
         mean_avg_peak,
-        color="green",
+        color="#ACE60D",
         linewidth=2,
         label="Median durchschnittlicher Tagespeak",
     )
@@ -1280,6 +1414,7 @@ if __name__ == "__main__":
             "office": 0.7,
             "meeting": 0.3,
             "not_office": 0.3,
+            "week_factor": week_factor,
         },
         "Team_B": {
             "num_employees": 30,
@@ -1287,6 +1422,7 @@ if __name__ == "__main__":
             "office": 0.6,
             "meeting": 0.25,
             "not_office": 0.4,
+            "week_factor": week_factor,
         },
         "Funktion_C": {
             "num_employees": 30,
@@ -1294,6 +1430,7 @@ if __name__ == "__main__":
             "office": 0.8,
             "meeting": 0.4,
             "not_office": 0.2,
+            "week_factor": week_factor,
         },
     }
 
@@ -1346,7 +1483,7 @@ if __name__ == "__main__":
     all_data, all_meetings = run_simulation(
         start_date=start_date,
         end_date=end_date,
-        week_factor=week_factor,
+        # week_factor=week_factor,
         profiles=profiles,
         min_bg=0.4,
         max_bg=1.0,
@@ -1355,7 +1492,7 @@ if __name__ == "__main__":
         weeks_not_working=7,
         iterations=20,
         seed=42,
-        min_cleardesk_hours=15,
+        min_cleardesk_hours=1.5,
         meeting_room_max_size=meeting_room_max_size,
         week_weighting=week_weighting,
         meeting_size_dist=meeting_size_dist,
@@ -1371,7 +1508,9 @@ if __name__ == "__main__":
         include_idle=True,
     )
 
-    plot_tagespeak(all_data).show()
+    # Anzahl Mitarbeiter aus Profilen
+    total_employees = sum(profile["num_employees"] for profile in profiles.values())
+    plot_tagespeak(all_data, total_employees).show()
     plot_meetingrooms(all_meetingrooms, "klein").show()
     plot_meetingrooms(all_meetingrooms, "mittel").show()
     plot_meetingrooms(all_meetingrooms, "gross").show()
