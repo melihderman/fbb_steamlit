@@ -223,7 +223,7 @@ start_df = st.sidebar.data_editor(start_df, num_rows="dynamic")
 meeting_start_time_dist = dict(zip(start_df["start_time"], start_df["probability"]))
 meeting_start_time_dist = normalize_dict(meeting_start_time_dist)
 
-meeting_start_time_dist = default_meeting_start_time_dist  # Keep fixed for now
+# meeting_start_time_dist = default_meeting_start_time_dist  # Keep fixed for now
 
 # Meeting Room Max Size
 st.sidebar.subheader("Meeting Room Max Size")
