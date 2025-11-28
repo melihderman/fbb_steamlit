@@ -171,7 +171,7 @@ def normalize_dict(d: dict) -> dict:
 # Sidebar inputs
 # -------------------------------------------------
 st.sidebar.header("Simulation Settings")
-iterations = st.sidebar.slider("Iterations", 1, 200, 20)
+iterations = st.sidebar.slider("Iterations", 1, 40, 20)
 seed = 42  # st.sidebar.number_input("Random Seed", value=42, step=1)
 min_bg = st.sidebar.slider("Min BG", 0.0, 1.0, 0.4, 0.1)
 max_bg = st.sidebar.slider("Max BG", 0.0, 1.0, 1.0, 0.1)
