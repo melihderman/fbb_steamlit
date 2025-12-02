@@ -93,6 +93,7 @@ default_profiles = {
         "office": 0.7,
         "meeting": 0.3,
         "not_office": 0.3,
+        # "assigned_workplace": 8,
         "week_factor": default_week_factor,  # Fixed week factor per profile for now
     },
     "Team_B": {
@@ -101,6 +102,7 @@ default_profiles = {
         "office": 0.6,
         "meeting": 0.25,
         "not_office": 0.4,
+        # "assigned_workplace": 6,
         "week_factor": default_week_factor,  # Fixed week factor per profile for now
     },
     "Funktion_C": {
@@ -109,6 +111,7 @@ default_profiles = {
         "office": 0.8,
         "meeting": 0.4,
         "not_office": 0.2,
+        # "assigned_workplace": 7,
         "week_factor": default_week_factor,  # Fixed week factor per profile for now
     },
 }
@@ -171,7 +174,7 @@ def normalize_dict(d: dict) -> dict:
 # Sidebar inputs
 # -------------------------------------------------
 st.sidebar.header("Simulation Settings")
-iterations = st.sidebar.slider("Iterations", 1, 40, 20)
+iterations = st.sidebar.slider("Iterations", 1, 200, 20)
 seed = 42  # st.sidebar.number_input("Random Seed", value=42, step=1)
 min_bg = st.sidebar.slider("Min BG", 0.0, 1.0, 0.4, 0.1)
 max_bg = st.sidebar.slider("Max BG", 0.0, 1.0, 1.0, 0.1)
@@ -201,7 +204,7 @@ size_df = st.sidebar.data_editor(size_df, num_rows="dynamic")
 meeting_size_dist = dict(zip(size_df["size"], size_df["probability"]))
 meeting_size_dist = normalize_dict(meeting_size_dist)
 
-meeting_size_dist = default_meeting_size_dist  # Keep fixed for now
+# meeting_size_dist = default_meeting_size_dist  # Keep fixed for now
 
 # Meeting Duration Distribution
 st.sidebar.subheader("Meeting Duration Distribution")
@@ -223,7 +226,7 @@ start_df = st.sidebar.data_editor(start_df, num_rows="dynamic")
 meeting_start_time_dist = dict(zip(start_df["start_time"], start_df["probability"]))
 meeting_start_time_dist = normalize_dict(meeting_start_time_dist)
 
-# meeting_start_time_dist = default_meeting_start_time_dist  # Keep fixed for now
+meeting_start_time_dist = default_meeting_start_time_dist  # Keep fixed for now
 
 # Meeting Room Max Size
 st.sidebar.subheader("Meeting Room Max Size")
@@ -265,6 +268,7 @@ for _, row in edited_df.iterrows():
         "office": row["office"],
         "meeting": row["meeting"],
         "not_office": row["not_office"],
+        # "assigned_workplace": row["assigned_workplace"],
         "week_factor": wf_cols,
     }
 # print(profiles)
@@ -296,7 +300,7 @@ if st.sidebar.button("Run Simulation"):
     if sw > 0:
         week_weighting = {k: v / sw for k, v in week_weighting.items()}
 
-    all_data, all_meetings = run_simulation(
+    all_einzelplatz_agg, all_meetings = run_simulation(
         start_date=default_start_date,
         end_date=default_end_date,
         # week_factor=week_factor,
@@ -331,7 +335,9 @@ if st.sidebar.button("Run Simulation"):
     # -------------------------------------------------
     st.subheader("📊 Einzelarbeitsplätze – Tagespeak")
     total_employees = sum(profile["num_employees"] for profile in profiles.values())
-    fig1 = plot_tagespeak(all_data, total_employees, cut_off_quantile, sharing_factor)
+    fig1 = plot_tagespeak(
+        all_einzelplatz_agg, total_employees, cut_off_quantile, sharing_factor
+    )
     st.pyplot(fig1)
 
     st.subheader("📊 Meetingräume – Tagespeak")
