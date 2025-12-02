@@ -300,7 +300,7 @@ if st.sidebar.button("Run Simulation"):
     if sw > 0:
         week_weighting = {k: v / sw for k, v in week_weighting.items()}
 
-    all_einzelplatz_agg, all_meetings = run_simulation(
+    all_data, all_meetings = run_simulation(
         start_date=default_start_date,
         end_date=default_end_date,
         # week_factor=week_factor,
@@ -335,9 +335,7 @@ if st.sidebar.button("Run Simulation"):
     # -------------------------------------------------
     st.subheader("📊 Einzelarbeitsplätze – Tagespeak")
     total_employees = sum(profile["num_employees"] for profile in profiles.values())
-    fig1 = plot_tagespeak(
-        all_einzelplatz_agg, total_employees, cut_off_quantile, sharing_factor
-    )
+    fig1 = plot_tagespeak(all_data, total_employees, cut_off_quantile, sharing_factor)
     st.pyplot(fig1)
 
     st.subheader("📊 Meetingräume – Tagespeak")
