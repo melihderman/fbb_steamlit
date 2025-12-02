@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Mapping, Optional, Tuple, Iterable
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -905,7 +905,7 @@ def run_simulation(
     }
 
     emp_id_start_global = 0
-
+    all_einzelplatz_agg: List[pd.DataFrame] = []
     for it in range(iterations):
         for unit, profile in profiles.items():
             num_employees = int(profile["num_employees"])  # type: ignore[index]
@@ -1078,50 +1078,58 @@ def run_simulation(
 
             emp_id_start_global += num_employees
 
-    def _cat(arrs: List[np.ndarray], dtype=None) -> np.ndarray:
-        out = np.concatenate(arrs)
-        return out.astype(dtype) if dtype is not None else out
+        def _cat(arrs: List[np.ndarray], dtype=None) -> np.ndarray:
+            out = np.concatenate(arrs)
+            return out.astype(dtype) if dtype is not None else out
 
-    replication = _cat(final_cols["replication"], dtype=np.int16)
-    date_idx = _cat(final_cols["date_idx"], dtype=np.int32)
-    time_idx = _cat(final_cols["time_idx"], dtype=np.int16)
-    unit_col = _cat(final_cols["unit"])
-    employee_id = _cat(final_cols["employee_id"], dtype=np.int32)
-    bg = _cat(final_cols["bg"], dtype=np.float32)
-    present = _cat(final_cols["present"], dtype=np.int8)
-    meeting = _cat(final_cols["meeting"], dtype=np.int8)
-    einzel_ap = _cat(final_cols["einzel_ap"], dtype=np.int8)
-    cleardesk = _cat(final_cols["cleardesk"], dtype=np.int8)
-    meeting_id_series = _cat(final_cols["meeting_id"], dtype=np.int32)
-    consec_meeting_slots = _cat(final_cols["consec_meeting_slots"], dtype=np.int16)
+        replication = _cat(final_cols["replication"], dtype=np.int16)
+        date_idx = _cat(final_cols["date_idx"], dtype=np.int32)
+        time_idx = _cat(final_cols["time_idx"], dtype=np.int16)
+        unit_col = _cat(final_cols["unit"])
+        employee_id = _cat(final_cols["employee_id"], dtype=np.int32)
+        bg = _cat(final_cols["bg"], dtype=np.float32)
+        present = _cat(final_cols["present"], dtype=np.int8)
+        meeting = _cat(final_cols["meeting"], dtype=np.int8)
+        einzel_ap = _cat(final_cols["einzel_ap"], dtype=np.int8)
+        cleardesk = _cat(final_cols["cleardesk"], dtype=np.int8)
+        meeting_id_series = _cat(final_cols["meeting_id"], dtype=np.int32)
+        consec_meeting_slots = _cat(final_cols["consec_meeting_slots"], dtype=np.int16)
 
-    dates = cal.work_dates[date_idx]
-    week_numbers = cal.iso_weeks_per_day[date_idx].astype(np.int16)
-    weekday_codes = cal.weekday_codes_per_day[date_idx]
-    time_float = cal.times_day[time_idx].astype(np.float32)
-    halfday_codes = np.where(time_idx < SLOTS_PER_HALFDAY, "am", "pm")
+        dates = cal.work_dates[date_idx]
+        week_numbers = cal.iso_weeks_per_day[date_idx].astype(np.int16)
+        weekday_codes = cal.weekday_codes_per_day[date_idx]
+        time_float = cal.times_day[time_idx].astype(np.float32)
+        halfday_codes = np.where(time_idx < SLOTS_PER_HALFDAY, "am", "pm")
 
-    all_data = pd.DataFrame(
-        {
-            "replication": replication,
-            "date": dates,
-            "halfday": pd.Categorical(halfday_codes, ordered=False),
-            "weekday": pd.Categorical(
-                weekday_codes, ordered=True, categories=DAY_CODES
-            ),
-            "weekNumber": week_numbers,
-            "unit": pd.Categorical(unit_col),
-            "employee_id": employee_id,
-            "bg": bg,
-            "present": present,
-            "meeting": meeting,
-            "einzel_ap": einzel_ap,
-            "time_float": time_float,
-            "meeting_id": meeting_id_series,
-            "cleardesk": cleardesk,
-            "consec_meeting_slots": consec_meeting_slots,
-        }
-    )
+        all_data = pd.DataFrame(
+            {
+                "replication": replication,
+                "date": dates,
+                "halfday": pd.Categorical(halfday_codes, ordered=False),
+                "weekday": pd.Categorical(
+                    weekday_codes, ordered=True, categories=DAY_CODES
+                ),
+                "weekNumber": week_numbers,
+                "unit": pd.Categorical(unit_col),
+                "employee_id": employee_id,
+                "bg": bg,
+                "present": present,
+                "meeting": meeting,
+                "einzel_ap": einzel_ap,
+                "time_float": time_float,
+                "meeting_id": meeting_id_series,
+                "cleardesk": cleardesk,
+                "consec_meeting_slots": consec_meeting_slots,
+            }
+        )
+        all_einzelplatz_agg.append(
+            all_data.groupby(
+                ["replication", "weekNumber", "date", "time_float"], observed=True
+            )["einzel_ap"]
+            .sum()
+            .reset_index()
+        )
+        print(f"Completed replication {it+1}/{iterations}")
 
     all_meetings = pd.DataFrame(
         all_meeting_records,
@@ -1144,7 +1152,7 @@ def run_simulation(
             all_meetings, meeting_room_max_size
         )
 
-    return all_data, all_meetings
+    return all_einzelplatz_agg, all_meetings
 
 
 # -------------------------------------------------
@@ -1153,40 +1161,48 @@ def run_simulation(
 
 
 def plot_tagespeak(
-    all_data: pd.DataFrame,
+    all_einzelplatz_agg: Union[pd.DataFrame, Iterable[pd.DataFrame]],
     total_employees: int,
     cut_off_quantile: float = CUT_OFF_QUANTILE,
     sharing_factor: float = SHARING_FACTOR,
 ):
     """Visualisierung wie im Beispielbild: Anzahl APs für verschiedene Quantile."""
 
-    group = (
-        all_data.groupby(["replication", "weekNumber", "date", "time_float"])[
+    if isinstance(all_einzelplatz_agg, pd.DataFrame):
+        einzelplatz_df = all_einzelplatz_agg.copy()
+    else:
+        einzelplatz_list = list(all_einzelplatz_agg)
+        if not einzelplatz_list:
+            raise ValueError("No Einzelplatz data available for plotting.")
+        einzelplatz_df = pd.concat(einzelplatz_list, ignore_index=True)
+
+    daily_peaks = (
+        einzelplatz_df.groupby(["replication", "weekNumber", "date"], observed=True)[
             "einzel_ap"
         ]
-        .sum()
-        .groupby(["replication", "weekNumber", "date"])
+        .max()
+        .reset_index()
     )
 
-    daily_peaks = group.max()  # Tagespeak je Replication & Datum
-    # daily_peaks.to_excel("daily_peaks.xlsx")
-    # tiefsten 20 % abschneiden
-    daily_peaks = daily_peaks.groupby(["replication", "weekNumber"]).apply(
-        lambda df: df[df >= df.quantile(cut_off_quantile)]
-    )
-    # daily_peaks.to_excel("daily_peaks_cut.xlsx")
+    cutoff_per_group = daily_peaks.groupby(
+        ["replication", "weekNumber"], observed=True
+    )["einzel_ap"].transform(lambda s: s.quantile(cut_off_quantile))
+    daily_peaks = daily_peaks[daily_peaks["einzel_ap"] >= cutoff_per_group]
+
     avg_peaks_per_rep = daily_peaks.groupby(
-        ["replication", "weekNumber"]
-    ).mean()  # Durchschnittlicher Tagespeak je Replication
+        ["replication", "weekNumber"], observed=True
+    )[
+        "einzel_ap"
+    ].mean()  # Durchschnittlicher Tagespeak je Replication
 
     # 3. Quantile (100% .. 5%)
     quantile_levels = np.arange(0.0, 1.0, 0.05) + 0.05
-    quantiles = np.quantile(avg_peaks_per_rep, q=quantile_levels)
+    quantiles = np.quantile(avg_peaks_per_rep.to_numpy(), q=quantile_levels)
 
     # 4. Zusatzlinien
     # Anzahl StandardAP bzw. EinzelAp mit Sharing-Faktor
     total_standap = total_employees * sharing_factor
-    max_daily_peak = daily_peaks.max()
+    max_daily_peak = daily_peaks["einzel_ap"].max()
     max_avg_peak = avg_peaks_per_rep.max()
     mean_avg_peak = avg_peaks_per_rep.median()
 
@@ -1248,12 +1264,6 @@ def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
     if df.empty:
         print(f"Keine Daten für {size} Meetingräume.")
         return
-
-    # group = (
-    #     df.groupby(["replication", "date", "time_float"])["busy"]
-    #     .sum()
-    #     .groupby(["replication", "date"])
-    # )
 
     # # 1. Tagespeak je Replication & Datum & Slot
     # daily_peaks = group.max()  # Tagespeak je Replication & Datum
@@ -1414,6 +1424,7 @@ if __name__ == "__main__":
             "office": 0.7,
             "meeting": 0.3,
             "not_office": 0.3,
+            # "assigned_workplace": 8,
             "week_factor": week_factor,
         },
         "Team_B": {
@@ -1422,6 +1433,7 @@ if __name__ == "__main__":
             "office": 0.6,
             "meeting": 0.25,
             "not_office": 0.4,
+            # "assigned_workplace": 6,
             "week_factor": week_factor,
         },
         "Funktion_C": {
@@ -1430,6 +1442,7 @@ if __name__ == "__main__":
             "office": 0.8,
             "meeting": 0.4,
             "not_office": 0.2,
+            # "assigned_workplace": 10,
             "week_factor": week_factor,
         },
     }
@@ -1480,7 +1493,7 @@ if __name__ == "__main__":
     }
     meeting_room_max_size = {"klein": 4, "mittel": 10, "gross": 20}
 
-    all_data, all_meetings = run_simulation(
+    all_einzelplatz_agg, all_meetings = run_simulation(
         start_date=start_date,
         end_date=end_date,
         # week_factor=week_factor,
@@ -1510,67 +1523,67 @@ if __name__ == "__main__":
 
     # Anzahl Mitarbeiter aus Profilen
     total_employees = sum(profile["num_employees"] for profile in profiles.values())
-    plot_tagespeak(all_data, total_employees).show()
+    plot_tagespeak(all_einzelplatz_agg, total_employees).show()
     plot_meetingrooms(all_meetingrooms, "klein").show()
     plot_meetingrooms(all_meetingrooms, "mittel").show()
     plot_meetingrooms(all_meetingrooms, "gross").show()
 
-    print("\nBG pro Einheit:")
-    bg_rep_mean = all_data.groupby(["replication", "unit"], observed=False)["bg"].mean()
-    bg_mean = bg_rep_mean.groupby("unit", observed=False).mean()
-    bg_std = bg_rep_mean.groupby("unit", observed=False).std()
-    for unit, profile in profiles.items():
-        target_rate = float(profile["employment_rate"])
-        print(
-            f"{unit}: {bg_mean[unit]:.3f} (+/-{bg_std[unit]:.3f}) (target: {target_rate:.3f})"
-        )
+    # print("\nBG pro Einheit:")
+    # bg_rep_mean = all_data.groupby(["replication", "unit"], observed=False)["bg"].mean()
+    # bg_mean = bg_rep_mean.groupby("unit", observed=False).mean()
+    # bg_std = bg_rep_mean.groupby("unit", observed=False).std()
+    # for unit, profile in profiles.items():
+    #     target_rate = float(profile["employment_rate"])
+    #     print(
+    #         f"{unit}: {bg_mean[unit]:.3f} (+/-{bg_std[unit]:.3f}) (target: {target_rate:.3f})"
+    #     )
 
-    print("\nAnteil Office pro Einheit:")
-    office_sum = all_data.groupby(["replication", "unit"], observed=False)[
-        "present"
-    ].sum()
-    office_share_mean = office_sum.groupby("unit", observed=False).mean()
-    office_share_std = office_sum.groupby("unit", observed=False).std()
-    for unit, profile in profiles.items():
-        num_employees = int(profile["num_employees"])
-        total_slots = (
-            num_employees * 5 * 45 * SLOTS_PER_DAY * (profile["employment_rate"])
-        )  # approx
-        share = office_share_mean[unit] / total_slots if total_slots > 0 else 0.0
-        std = office_share_std[unit] / total_slots if total_slots > 0 else 0.0
-        print(f"{unit}: {share:.3f} (+/-{std:.3f}) (target: {profile['office']:.3f})")
+    # print("\nAnteil Office pro Einheit:")
+    # office_sum = all_data.groupby(["replication", "unit"], observed=False)[
+    #     "present"
+    # ].sum()
+    # office_share_mean = office_sum.groupby("unit", observed=False).mean()
+    # office_share_std = office_sum.groupby("unit", observed=False).std()
+    # for unit, profile in profiles.items():
+    #     num_employees = int(profile["num_employees"])
+    #     total_slots = (
+    #         num_employees * 5 * 45 * SLOTS_PER_DAY * (profile["employment_rate"])
+    #     )  # approx
+    #     share = office_share_mean[unit] / total_slots if total_slots > 0 else 0.0
+    #     std = office_share_std[unit] / total_slots if total_slots > 0 else 0.0
+    #     print(f"{unit}: {share:.3f} (+/-{std:.3f}) (target: {profile['office']:.3f})")
 
-    print("\nMeeting Rate pro Einheit:")
-    meeting_sum = all_data.groupby(["replication", "unit"], observed=False)[
-        "meeting"
-    ].sum()
-    meeting_sum_mean = meeting_sum.groupby("unit", observed=False).mean()
-    meeting_sum_std = meeting_sum.groupby("unit", observed=False).std()
-    for unit, profile in profiles.items():
-        denom = office_share_mean[unit] if office_share_mean[unit] > 0 else 1.0
-        share_mean = meeting_sum_mean[unit] / denom
-        share_std = meeting_sum_std[unit] / denom
-        print(
-            f"{unit}: {share_mean:.3f} (+/-{share_std:.3f}) (target: {profile['meeting']:.3f})"
-        )
+    # print("\nMeeting Rate pro Einheit:")
+    # meeting_sum = all_data.groupby(["replication", "unit"], observed=False)[
+    #     "meeting"
+    # ].sum()
+    # meeting_sum_mean = meeting_sum.groupby("unit", observed=False).mean()
+    # meeting_sum_std = meeting_sum.groupby("unit", observed=False).std()
+    # for unit, profile in profiles.items():
+    #     denom = office_share_mean[unit] if office_share_mean[unit] > 0 else 1.0
+    #     share_mean = meeting_sum_mean[unit] / denom
+    #     share_std = meeting_sum_std[unit] / denom
+    #     print(
+    #         f"{unit}: {share_mean:.3f} (+/-{share_std:.3f}) (target: {profile['meeting']:.3f})"
+    #     )
 
-    print("\nWochentagsverteilung Präsenz (in %):")
-    present_by_dow = all_data.groupby("weekday", observed=False)["present"].sum()
-    total_present = present_by_dow.sum()
-    present_pct = (present_by_dow / total_present * 100).round(2)
-    for d in DAY_CODES:
-        target_pct = week_factor[d] * 100
-        actual_pct = present_pct.get(d, 0.0)
-        print(f"{d}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
+    # print("\nWochentagsverteilung Präsenz (in %):")
+    # present_by_dow = all_data.groupby("weekday", observed=False)["present"].sum()
+    # total_present = present_by_dow.sum()
+    # present_pct = (present_by_dow / total_present * 100).round(2)
+    # for d in DAY_CODES:
+    #     target_pct = week_factor[d] * 100
+    #     actual_pct = present_pct.get(d, 0.0)
+    #     print(f"{d}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
 
-    print("\nVerteilung auf Wochen (in %):")
-    present_by_week = all_data.groupby("weekNumber", observed=False)["present"].sum()
-    total_present = present_by_week.sum()
-    present_pct = (present_by_week / total_present * 100).round(2)
-    for week, weight in sorted(week_weighting.items()):
-        w = int(week)
-        target_pct = weight / sum(week_weighting.values()) * 100
-        actual_pct = present_pct.get(w, 0.0)
-        print(f"Woche {w}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
+    # print("\nVerteilung auf Wochen (in %):")
+    # present_by_week = all_data.groupby("weekNumber", observed=False)["present"].sum()
+    # total_present = present_by_week.sum()
+    # present_pct = (present_by_week / total_present * 100).round(2)
+    # for week, weight in sorted(week_weighting.items()):
+    #     w = int(week)
+    #     target_pct = weight / sum(week_weighting.values()) * 100
+    #     actual_pct = present_pct.get(w, 0.0)
+    #     print(f"Woche {w}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
 
     input("\nFertig. Enter zum Beenden...")
