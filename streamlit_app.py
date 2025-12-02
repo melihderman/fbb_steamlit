@@ -295,6 +295,8 @@ def _cached_simulation(
         meeting_size_dist=meeting_size_dist,
         meeting_duration_dist=meeting_duration_dist,
         meeting_start_time_dist=meeting_start_time_dist,
+        memory_mode="compact",
+        return_meetings=True,
     )
 
 

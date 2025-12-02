@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import heapq
+import gc
 
 # -------------------------------------------------
 # Types & Data Classes
@@ -830,10 +831,8 @@ def build_room_occupancy_slots(
 
 
 def run_simulation(
-    *,
     start_date: date,
     end_date: date,
-    # week_factor: Dict[str, float],
     profiles: Dict[str, Dict[str, float]],
     min_bg: float = 0.4,
     max_bg: float = 1.0,
@@ -843,42 +842,60 @@ def run_simulation(
     iterations: int = 1,
     seed: int | None = 42,
     min_cleardesk_hours: float = 1.5,
-    meeting_room_max_size: Mapping[str, int] = None,
+    meeting_room_max_size: Mapping[str, int] | None = None,
     week_weighting: Optional[Mapping[int, float]] = None,
-    meeting_size_dist: Mapping[int, float] = None,
-    meeting_duration_dist: Mapping[float, float] = None,
-    meeting_start_time_dist: Mapping[float, float] = None,
+    meeting_size_dist: Mapping[int, float] | None = None,
+    meeting_duration_dist: Mapping[float, float] | None = None,
+    meeting_start_time_dist: Mapping[float, float] | None = None,
+    # NEU: speicherschonende Ausgabe
+    memory_mode: str = "compact",  # "compact" (neu, default) oder "full" (alt)
+    # NEU: Meetings optional weglassen (falls nur AP-Peaks benötigt)
+    return_meetings: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Run full simulation in NumPy; create pandas DataFrames once at the end."""
+    """
+    Simulation. Zwei Modi:
+      - memory_mode="compact"  → gibt slot-aggregierte Daten zurück
+        (Spalten: replication, date, weekday, weekNumber, time_float, einzel_ap).
+      - memory_mode="full"     → alter Modus (employee×day×slot), sehr speicherintensiv.
+
+    return_meetings=False spart zusätzlich RAM/CPU (kein Meeting-Scheduling).
+    """
+    if memory_mode not in ("compact", "full"):
+        raise ValueError("memory_mode must be 'compact' or 'full'")
+
     rng = np.random.default_rng(seed)
 
-    # # Calendar & categories
-    # cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
-    #     start_date, end_date, week_factor
-    # )
-
-    # Week weights from mapping (normalize over weeks present)
+    # --- Wochenraster & Gewichte 1x vorbereiten ---
     weeks = pd.date_range(start=start_date, end=end_date, freq="W-MON")
-    iso_weeks = weeks.isocalendar().week.to_numpy().astype(int)
+    iso_weeks = weeks.isocalendar().week.to_numpy().astype(np.int16)
     if week_weighting is None:
-        week_weights = np.ones(len(weeks), dtype=float)
+        week_weights = np.ones(len(weeks), dtype=np.float32)
     else:
         week_weights = np.array(
-            [float(week_weighting.get(int(w), 1.0)) for w in iso_weeks], dtype=float
+            [float(week_weighting.get(int(w), 1.0)) for w in iso_weeks],
+            dtype=np.float32,
         )
     week_weights[~np.isfinite(week_weights) | (week_weights < 0)] = 0.0
-    if week_weights.sum() <= 0:
-        week_weights = np.ones(len(weeks), dtype=float)
-    week_weights = week_weights / week_weights.sum()
+    if float(week_weights.sum()) <= 0.0:
+        week_weights = np.ones(len(weeks), dtype=np.float32)
+    week_weights = (week_weights / week_weights.sum()).astype(np.float32, copy=False)
 
+    # --- Distributions vorbereiten (downcast) ---
     def _prep_dist(
         d: Mapping[float, float], dtype=float
     ) -> Tuple[np.ndarray, np.ndarray]:
         vals = np.array(list(d.keys()), dtype=dtype)
-        probs = np.array(list(d.values()), dtype=float)
-        s = probs.sum()
+        probs = np.array(list(d.values()), dtype=np.float32)
+        s = float(probs.sum())
         probs = probs / s if s > 0 else np.ones_like(probs) / len(probs)
         return vals, probs
+
+    if (
+        meeting_size_dist is None
+        or meeting_duration_dist is None
+        or meeting_start_time_dist is None
+    ):
+        raise ValueError("meeting_*_dist mappings must be provided")
 
     size_vals, size_probs = _prep_dist(meeting_size_dist, dtype=int)
     dur_vals, dur_probs = _prep_dist(meeting_duration_dist, dtype=float)
@@ -889,35 +906,62 @@ def run_simulation(
 
     min_cleardesk_slots = int(round(min_cleardesk_hours / SLOT_LEN_HOURS))
 
-    final_cols: Dict[str, List[np.ndarray]] = {
-        "replication": [],
-        "date_idx": [],
-        "time_idx": [],
-        "unit": [],
-        "employee_id": [],
-        "bg": [],
-        "present": [],
-        "meeting": [],
-        "einzel_ap": [],
-        "cleardesk": [],
-        "meeting_id": [],
-        "consec_meeting_slots": [],
-    }
+    # Speicherstruktur für FULL
+    final_cols: Dict[str, List[np.ndarray]] | None = None
+    if memory_mode == "full":
+        final_cols = {
+            "replication": [],
+            "date_idx": [],
+            "time_idx": [],
+            "unit": [],
+            "employee_id": [],
+            "bg": [],
+            "present": [],
+            "meeting": [],
+            "einzel_ap": [],
+            "cleardesk": [],
+            "meeting_id": [],
+            "consec_meeting_slots": [],
+        }
 
-    emp_id_start_global = 0
+    # Speicherstruktur für COMPACT (aggregiert pro Slot)
+    agg_rows: List[dict] | None = None
+    if memory_mode == "compact":
+        agg_rows = []
+
+    emp_id_start_global = 0  # für FULL
+
+    # ISO→Position remap (für adjust_presence_to_targets)
+    remap = np.full(54, -1, dtype=np.int16)
+    remap[iso_weeks] = np.arange(len(iso_weeks), dtype=np.int16)
+
+    # Kalender 1x pro (start,end,week_factor)-Kombination pro Unit cachen
+    cal_cache: dict[
+        Tuple[int, int, Tuple[Tuple[str, float], ...]],
+        Tuple[Calendar, List[str], np.ndarray],
+    ] = {}
 
     for it in range(iterations):
         for unit, profile in profiles.items():
-            num_employees = int(profile["num_employees"])  # type: ignore[index]
-            target_rate = float(profile["employment_rate"])  # type: ignore[index]
-            office_share = float(profile["office"])  # type: ignore[index]
-            meeting_ratio_center = float(profile["meeting"])  # type: ignore[index]
+            num_employees = int(profile["num_employees"])
+            target_rate = float(profile["employment_rate"])
+            office_share = float(profile["office"])
+            meeting_ratio_center = float(profile["meeting"])
             week_factor = profile.get("week_factor", {})
-            # Calendar & categories
-            cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
-                start_date, end_date, week_factor
-            )
 
+            # --- Calendar & categories (Cache) ---
+            wf_key = tuple(sorted((week_factor or {}).items()))
+            cache_key = (start_date.toordinal(), end_date.toordinal(), wf_key)
+            if cache_key in cal_cache:
+                cal, halfdays, halfday_probs = cal_cache[cache_key]
+            else:
+                cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
+                    start_date, end_date, week_factor
+                )
+                halfday_probs = halfday_probs.astype(np.float32, copy=False)
+                cal_cache[cache_key] = (cal, halfdays, halfday_probs)
+
+            # --- BGs ---
             bgs = draw_bgs(
                 rng,
                 num_employees=num_employees,
@@ -926,17 +970,23 @@ def run_simulation(
                 max_bg=max_bg,
                 step_bg=step_bg,
                 tolerance=employment_rate_variability,
-            )
+            ).astype(np.float32, copy=False)
 
+            # --- Wochenwahl pro Mitarbeiter ---
             week_map = sample_working_weeks_vectorized(
                 rng,
                 iso_weeks=iso_weeks,
                 week_weights=week_weights,
                 num_employees=num_employees,
                 weeks_not_working=weeks_not_working,
+            )  # (E,54) bool
+            week_idx_half = remap[cal.slot_weeknums_half]  # 0..n_weeks-1
+            week_idx_half = np.where(week_idx_half < 0, 0, week_idx_half).astype(
+                np.int16, copy=False
             )
-            weekmask_half = week_map[:, cal.slot_weeknums_half]
+            weekmask_half = week_map[:, cal.slot_weeknums_half]  # (E,2D) bool
 
+            # --- Kategorienwahl (halbtage) ---
             n_cats = len(halfdays)
             chosen_cat_mask = build_category_mask_vectorized(
                 rng,
@@ -944,27 +994,19 @@ def run_simulation(
                 bgs=bgs,
                 n_cats=n_cats,
                 halfday_probs=halfday_probs,
-            )
-            catmask_half = chosen_cat_mask[:, cal.slot_cat_idx_half]
+            )  # (E,n_cats) bool
+            catmask_half = chosen_cat_mask[:, cal.slot_cat_idx_half]  # (E,2D) bool
 
+            # --- Präsenzmatrix (E,2D) & Balancing ---
             present_half = catmask_half & weekmask_half
             weeks_working = max(0, len(iso_weeks) - weeks_not_working)
 
             total_slots_unit = int(np.sum(bgs * 10)) * max(weeks_working, 0)
             targets = np.rint(halfday_probs * total_slots_unit * office_share).astype(
-                int
+                np.int32
             )
 
-            # --- Optimiertes Balancing: Wochen & Kategorien mit Toleranzen ---
-            # ISO-Woche → Positionsindex im aktuellen Zeitraum
-            remap = np.full(54, -1, dtype=np.int32)
-            remap[iso_weeks] = np.arange(len(iso_weeks), dtype=np.int32)
-            week_idx_half = remap[cal.slot_weeknums_half]
-            if np.any(week_idx_half < 0):
-                # Sollte nicht passieren; defensiv auf 0 setzen
-                week_idx_half = np.where(week_idx_half < 0, 0, week_idx_half)
-
-            present_half, _metrics = adjust_presence_to_targets(
+            present_half, _ = adjust_presence_to_targets(
                 present_half,
                 week_weights=week_weights,
                 total_slots_unit=total_slots_unit,
@@ -977,6 +1019,7 @@ def run_simulation(
                 max_iter=10,
             )
 
+            # --- Slots (E,D,S) temporär aufbauen ---
             E, twoD = present_half.shape
             D = cal.n_days
             assert twoD == 2 * D
@@ -984,145 +1027,161 @@ def run_simulation(
                 present_half.reshape(E, D, 2)[:, :, :, None]
                 .repeat(SLOTS_PER_HALFDAY, axis=3)
                 .reshape(E, D, SLOTS_PER_DAY)
-            ).astype(np.int8)
+            ).astype(np.int8, copy=False)
 
-            meeting = np.zeros_like(present_slots, dtype=np.int8)
-            meeting_id_arr = np.full_like(present_slots, -1, dtype=np.int32)
+            # Meeting-Matrizen (nur wenn benötigt)
+            if return_meetings:
+                meeting = np.zeros_like(present_slots, dtype=np.int8)
+                meeting_id_arr = np.full_like(present_slots, -1, dtype=np.int32)
+            else:
+                meeting = None
+                meeting_id_arr = None
+
             einzel_ap = present_slots.copy()
 
-            present_half_sum_by_day = present_half.sum(axis=0).reshape(D, 2)
-            present_total_per_day = present_half_sum_by_day.sum(axis=1).astype(int)
+            # --- Meetings erzeugen & zuweisen (optional) ---
+            if return_meetings:
+                present_half_sum_by_day = present_half.sum(axis=0).reshape(D, 2)
+                present_total_per_day = present_half_sum_by_day.sum(axis=1).astype(int)
 
-            for day_idx, dts in enumerate(cal.work_dates):
-                present_total = int(present_total_per_day[day_idx])
-                if present_total == 0:
-                    continue
-                meet_ratio = rng.triangular(
-                    meeting_ratio_center - 0.03,
-                    meeting_ratio_center,
-                    meeting_ratio_center + 0.07,
+                for day_idx, dts in enumerate(cal.work_dates):
+                    present_total = int(present_total_per_day[day_idx])
+                    if present_total == 0:
+                        continue
+                    meet_ratio = rng.triangular(
+                        meeting_ratio_center - 0.03,
+                        meeting_ratio_center,
+                        meeting_ratio_center + 0.07,
+                    )
+                    total_meetingtime = np.float32(4.5 * present_total * meet_ratio)
+                    meetings = generate_meetings(
+                        rng,
+                        float(total_meetingtime),
+                        size_vals,
+                        size_probs,
+                        dur_vals,
+                        dur_probs,
+                        start_vals,
+                        start_probs,
+                        max_draws=100,
+                    )
+                    if meetings.size == 0:
+                        continue
+
+                    next_meeting_id, all_meeting_records = _assign_meetings_numpy(
+                        rng,
+                        it,
+                        present_slots,
+                        meeting,
+                        meeting_id_arr,
+                        cal.times_day,
+                        unit,
+                        day_idx,
+                        dts,
+                        next_meeting_id,
+                        all_meeting_records,
+                        meetings,
+                    )
+
+                # Cleardesk & Einzel-AP nach Meetings
+                consec = _run_lengths_meeting_segments(meeting)
+                cleardesk = ((meeting == 1) & (consec >= min_cleardesk_slots)).astype(
+                    np.int8, copy=False
                 )
-                total_meetingtime = 4.5 * present_total * meet_ratio
-                meetings = generate_meetings(
-                    rng,
-                    total_meetingtime,
-                    size_vals,
-                    size_probs,
-                    dur_vals,
-                    dur_probs,
-                    start_vals,
-                    start_probs,
-                    max_draws=100,
+                einzel_ap = (einzel_ap & (1 - cleardesk)).astype(np.int8, copy=False)
+                del consec, cleardesk
+            # else: einzel_ap = present_slots (keine Meetings)
+
+            # --- OUTPUT: je nach memory_mode ---
+            if memory_mode == "full":
+                # flatten (sehr speicherintensiv!)
+                n_rows_unit = num_employees * D * SLOTS_PER_DAY
+                date_idx_flat = np.tile(
+                    np.repeat(np.arange(D, dtype=np.int32), SLOTS_PER_DAY),
+                    num_employees,
                 )
-                if meetings.size == 0:
-                    continue
-
-                next_meeting_id, all_meeting_records = _assign_meetings_numpy(
-                    rng,
-                    it,
-                    present_slots,
-                    meeting,
-                    meeting_id_arr,
-                    cal.times_day,
-                    unit,
-                    day_idx,
-                    dts,
-                    next_meeting_id,
-                    all_meeting_records,
-                    meetings,
+                time_idx_flat = np.tile(
+                    np.tile(np.arange(SLOTS_PER_DAY, dtype=np.int16), D), num_employees
                 )
+                emp_ids = np.arange(
+                    emp_id_start_global + 1,
+                    emp_id_start_global + 1 + num_employees,
+                    dtype=np.int32,
+                )
+                emp_id_flat = np.repeat(emp_ids, D * SLOTS_PER_DAY)
 
-            consec = _run_lengths_meeting_segments(meeting)
-            cleardesk = ((meeting == 1) & (consec >= min_cleardesk_slots)).astype(
-                np.int8
-            )
-            einzel_ap = (einzel_ap & (1 - cleardesk)).astype(np.int8)
+                present_flat = present_slots.reshape(-1)
+                meeting_flat = (
+                    meeting.reshape(-1)
+                    if return_meetings
+                    else np.zeros(n_rows_unit, dtype=np.int8)
+                )
+                einzel_flat = einzel_ap.reshape(-1)
+                meeting_id_flat = (
+                    meeting_id_arr.reshape(-1)
+                    if return_meetings
+                    else np.full(n_rows_unit, -1, dtype=np.int32)
+                )
+                # Nota bene: consec war nur für cleardesk nötig; wenn gewünscht, neu berechnen oder 0en:
+                consec_flat = np.zeros(n_rows_unit, dtype=np.int16)
 
-            n_rows_unit = num_employees * D * SLOTS_PER_DAY
-            date_idx_flat = np.tile(
-                np.repeat(np.arange(D, dtype=np.int32), SLOTS_PER_DAY), num_employees
-            )
-            time_idx_flat = np.tile(
-                np.tile(np.arange(SLOTS_PER_DAY, dtype=np.int16), D), num_employees
-            )
+                bg_flat = np.repeat(bgs.astype(np.float32), D * SLOTS_PER_DAY)
 
-            emp_ids = np.arange(
-                emp_id_start_global + 1,
-                emp_id_start_global + 1 + num_employees,
-                dtype=np.int32,
-            )
-            emp_id_flat = np.repeat(emp_ids, D * SLOTS_PER_DAY)
+                final_cols["replication"].append(
+                    np.full(n_rows_unit, it, dtype=np.int16)
+                )
+                final_cols["date_idx"].append(date_idx_flat)
+                final_cols["time_idx"].append(time_idx_flat)
+                final_cols["unit"].append(
+                    np.repeat(np.array(unit, dtype=object), n_rows_unit)
+                )
+                final_cols["employee_id"].append(emp_id_flat)
+                final_cols["bg"].append(bg_flat)
+                final_cols["present"].append(present_flat.astype(np.int8))
+                final_cols["meeting"].append(meeting_flat.astype(np.int8))
+                final_cols["einzel_ap"].append(einzel_flat.astype(np.int8))
+                final_cols["cleardesk"].append(
+                    (present_flat - einzel_flat).astype(np.int8)
+                )
+                final_cols["meeting_id"].append(meeting_id_flat.astype(np.int32))
+                final_cols["consec_meeting_slots"].append(consec_flat)
 
-            present_flat = present_slots.reshape(-1)
-            meeting_flat = meeting.reshape(-1)
-            einzel_flat = einzel_ap.reshape(-1)
-            cleardesk_flat = cleardesk.reshape(-1)
-            meeting_id_flat = meeting_id_arr.reshape(-1)
-            consec_flat = consec.reshape(-1).astype(np.int16)
-            bg_flat = np.repeat(bgs.astype(np.float32), D * SLOTS_PER_DAY)
+                emp_id_start_global += num_employees
 
-            final_cols["replication"].append(np.full(n_rows_unit, it, dtype=np.int16))
-            final_cols["date_idx"].append(date_idx_flat)
-            final_cols["time_idx"].append(time_idx_flat)
-            final_cols["unit"].append(
-                np.repeat(np.array(unit, dtype=object), n_rows_unit)
-            )
-            final_cols["employee_id"].append(emp_id_flat)
-            final_cols["bg"].append(bg_flat)
-            final_cols["present"].append(present_flat.astype(np.int8))
-            final_cols["meeting"].append(meeting_flat.astype(np.int8))
-            final_cols["einzel_ap"].append(einzel_flat.astype(np.int8))
-            final_cols["cleardesk"].append(cleardesk_flat.astype(np.int8))
-            final_cols["meeting_id"].append(meeting_id_flat.astype(np.int32))
-            final_cols["consec_meeting_slots"].append(consec_flat)
+            else:
+                # COMPACT: pro (replication, date, time_idx) aggregieren
+                # Summe über Mitarbeiter (E) → (D,S)
+                einzel_sum = einzel_ap.sum(axis=0).astype(np.int16, copy=False)  # (D,S)
+                # in Records schütten (keine Unit-Spalte nötig für Tagespeak)
+                for d_idx in range(D):
+                    date_ts = cal.work_dates[d_idx]
+                    week_no = int(cal.iso_weeks_per_day[d_idx])
+                    weekday_code = str(cal.weekday_codes_per_day[d_idx])
+                    # Vektor der 18 Slots
+                    times = cal.times_day  # 18 floats
+                    # eine Schleife ist hier i. d. R. günstiger als concat von 18 kleinen Frames
+                    for s_idx in range(SLOTS_PER_DAY):
+                        val = int(einzel_sum[d_idx, s_idx])
+                        if val == 0:
+                            continue  # spart Zeilen
+                        agg_rows.append(
+                            {
+                                "replication": np.int16(it),
+                                "date": date_ts,
+                                "weekday": weekday_code,
+                                "weekNumber": np.int16(week_no),
+                                "time_float": float(times[s_idx]),
+                                "einzel_ap": np.int16(val),
+                            }
+                        )
 
-            emp_id_start_global += num_employees
+            # --- temporäre Arrays freigeben ---
+            del present_slots, einzel_ap
+            if return_meetings:
+                del meeting, meeting_id_arr
+            gc.collect()
 
-    def _cat(arrs: List[np.ndarray], dtype=None) -> np.ndarray:
-        out = np.concatenate(arrs)
-        return out.astype(dtype) if dtype is not None else out
-
-    replication = _cat(final_cols["replication"], dtype=np.int16)
-    date_idx = _cat(final_cols["date_idx"], dtype=np.int32)
-    time_idx = _cat(final_cols["time_idx"], dtype=np.int16)
-    unit_col = _cat(final_cols["unit"])
-    employee_id = _cat(final_cols["employee_id"], dtype=np.int32)
-    bg = _cat(final_cols["bg"], dtype=np.float32)
-    present = _cat(final_cols["present"], dtype=np.int8)
-    meeting = _cat(final_cols["meeting"], dtype=np.int8)
-    einzel_ap = _cat(final_cols["einzel_ap"], dtype=np.int8)
-    cleardesk = _cat(final_cols["cleardesk"], dtype=np.int8)
-    meeting_id_series = _cat(final_cols["meeting_id"], dtype=np.int32)
-    consec_meeting_slots = _cat(final_cols["consec_meeting_slots"], dtype=np.int16)
-
-    dates = cal.work_dates[date_idx]
-    week_numbers = cal.iso_weeks_per_day[date_idx].astype(np.int16)
-    weekday_codes = cal.weekday_codes_per_day[date_idx]
-    time_float = cal.times_day[time_idx].astype(np.float32)
-    halfday_codes = np.where(time_idx < SLOTS_PER_HALFDAY, "am", "pm")
-
-    all_data = pd.DataFrame(
-        {
-            "replication": replication,
-            "date": dates,
-            "halfday": pd.Categorical(halfday_codes, ordered=False),
-            "weekday": pd.Categorical(
-                weekday_codes, ordered=True, categories=DAY_CODES
-            ),
-            "weekNumber": week_numbers,
-            "unit": pd.Categorical(unit_col),
-            "employee_id": employee_id,
-            "bg": bg,
-            "present": present,
-            "meeting": meeting,
-            "einzel_ap": einzel_ap,
-            "time_float": time_float,
-            "meeting_id": meeting_id_series,
-            "cleardesk": cleardesk,
-            "consec_meeting_slots": consec_meeting_slots,
-        }
-    )
-
+    # --- Meetings-DF bauen ---
     all_meetings = pd.DataFrame(
         all_meeting_records,
         columns=[
@@ -1138,11 +1197,82 @@ def run_simulation(
             "end_time",
         ],
     )
-
-    if not all_meetings.empty:
+    if return_meetings and meeting_room_max_size and not all_meetings.empty:
         all_meetings["meeting_room_size"] = compute_meeting_room_size(
             all_meetings, meeting_room_max_size
         )
+
+    # --- all_data aufbauen ---
+    if memory_mode == "full":
+
+        def _cat(arrs: List[np.ndarray], dtype=None) -> np.ndarray:
+            out = np.concatenate(arrs) if arrs else np.array([], dtype=dtype or object)
+            return out.astype(dtype) if dtype is not None else out
+
+        replication = _cat(final_cols["replication"], dtype=np.int16)
+        date_idx = _cat(final_cols["date_idx"], dtype=np.int32)
+        time_idx = _cat(final_cols["time_idx"], dtype=np.int16)
+        unit_col = _cat(final_cols["unit"])
+        employee_id = _cat(final_cols["employee_id"], dtype=np.int32)
+        bg = _cat(final_cols["bg"], dtype=np.float32)
+        present = _cat(final_cols["present"], dtype=np.int8)
+        meeting = _cat(final_cols["meeting"], dtype=np.int8)
+        einzel_ap = _cat(final_cols["einzel_ap"], dtype=np.int8)
+        meeting_id_series = _cat(final_cols["meeting_id"], dtype=np.int32)
+        consec_meeting_slots = _cat(final_cols["consec_meeting_slots"], dtype=np.int16)
+
+        # Achtung: cal stammt aus dem letzten Profile – hier korrekt, da alle Units denselben Datumsraster teilen
+        # (date_idx/time_idx referenzieren überall denselben Kalender)
+        # Für absolute Korrektheit könnte man cal aus Cache nehmen; identisch.
+        if not cal_cache:
+            raise RuntimeError("Calendar cache unexpectedly empty.")
+        any_cal = next(iter(cal_cache.values()))[0]
+        dates = any_cal.work_dates[date_idx]
+        week_numbers = any_cal.iso_weeks_per_day[date_idx].astype(np.int16)
+        weekday_codes = any_cal.weekday_codes_per_day[date_idx]
+        time_float = any_cal.times_day[time_idx].astype(np.float32)
+        halfday_codes = np.where(time_idx < SLOTS_PER_HALFDAY, "am", "pm")
+
+        all_data = pd.DataFrame(
+            {
+                "replication": replication,
+                "date": dates,
+                "halfday": pd.Categorical(halfday_codes, ordered=False),
+                "weekday": pd.Categorical(
+                    weekday_codes, ordered=True, categories=DAY_CODES
+                ),
+                "weekNumber": week_numbers,
+                "unit": pd.Categorical(unit_col),
+                "employee_id": employee_id,
+                "bg": bg,
+                "present": present,
+                "meeting": meeting,
+                "einzel_ap": einzel_ap,
+                "time_float": time_float,
+                "meeting_id": meeting_id_series,
+                "cleardesk": (present - einzel_ap).astype(np.int8, copy=False),
+                "consec_meeting_slots": consec_meeting_slots,
+            }
+        )
+    else:
+        # COMPACT-Frame
+        if not agg_rows:
+            all_data = pd.DataFrame(
+                columns=[
+                    "replication",
+                    "date",
+                    "weekday",
+                    "weekNumber",
+                    "time_float",
+                    "einzel_ap",
+                ]
+            )
+        else:
+            all_data = pd.DataFrame.from_records(agg_rows)
+            # Kategorien setzen wie im Full-Modus (für identische Groupby-Ergebnisse)
+            all_data["weekday"] = pd.Categorical(
+                all_data["weekday"], ordered=True, categories=DAY_CODES
+            )
 
     return all_data, all_meetings
 
