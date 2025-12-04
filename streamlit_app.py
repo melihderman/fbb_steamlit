@@ -154,7 +154,7 @@ default_meeting_start_time_dist = {
     16: 0.05,
     16.5: 0.03,
 }
-default_meeting_room_max_size = {"klein": 4, "mittel": 10, "gross": 20}
+default_meeting_room_max_size = {"klein": 4, "mittel": 8, "gross": 16}
 
 # ---------------------------
 # Helpers
@@ -180,9 +180,35 @@ max_bg = st.sidebar.slider("Max BG", 0.0, 1.0, 1.0, 0.1)
 step_bg = st.sidebar.slider("Step BG", 0.01, 0.2, 0.1, 0.01)
 tolerance = st.sidebar.slider("Employment Rate Tolerance", 0.0, 0.2, 0.05, 0.01)
 weeks_not_working = st.sidebar.slider("Weeks Not Working", 0, 12, 7)
-min_cleardesk_hours = st.sidebar.slider("Cleardesk Hours", 0.5, 4.0, 1.5, 0.5)
+min_cleardesk_hours = st.sidebar.slider("Cleardesk Hours", 0.5, 4.0, 2.0, 0.5)
 sharing_factor = st.sidebar.slider("Sharing Ratio", 0.0, 1.0, 0.8, 0.05)
 cut_off_quantile = st.sidebar.slider("Cut-off Quantile", 0.0, 0.5, 0.2, 0.05)
+
+# Profiles
+st.sidebar.subheader("Profiles")
+profiles_df = (
+    pd.DataFrame.from_dict(default_profiles, orient="index")
+    .reset_index()
+    .rename(columns={"index": "unit"})
+)
+week_df = profiles_df["week_factor"].apply(pd.Series)
+week_df.columns = [f"wf_{c}" for c in week_df.columns]
+profiles_df = pd.concat([profiles_df.drop(columns=["week_factor"]), week_df], axis=1)
+edited_df = st.sidebar.data_editor(profiles_df, num_rows="dynamic")
+
+profiles = {}
+for _, row in edited_df.iterrows():
+    wf_cols = {
+        c.replace("wf_", ""): row[c] for c in edited_df.columns if c.startswith("wf_")
+    }
+    profiles[row["unit"]] = {
+        "num_employees": int(row["num_employees"]),
+        "employment_rate": float(row["employment_rate"]),
+        "office": float(row["office"]),
+        "meeting": float(row["meeting"]),
+        "not_office": float(row["not_office"]),
+        "week_factor": normalize_dict(wf_cols),
+    }
 
 # Meeting Size Distribution
 st.sidebar.subheader("Meeting Size Distribution")
@@ -220,31 +246,6 @@ room_size_df = pd.DataFrame(
 room_size_df = st.sidebar.data_editor(room_size_df, num_rows="dynamic")
 meeting_room_max_size = dict(zip(room_size_df["room"], room_size_df["capacity"]))
 
-# Profiles
-st.sidebar.subheader("Profiles")
-profiles_df = (
-    pd.DataFrame.from_dict(default_profiles, orient="index")
-    .reset_index()
-    .rename(columns={"index": "unit"})
-)
-week_df = profiles_df["week_factor"].apply(pd.Series)
-week_df.columns = [f"wf_{c}" for c in week_df.columns]
-profiles_df = pd.concat([profiles_df.drop(columns=["week_factor"]), week_df], axis=1)
-edited_df = st.sidebar.data_editor(profiles_df, num_rows="dynamic")
-
-profiles = {}
-for _, row in edited_df.iterrows():
-    wf_cols = {
-        c.replace("wf_", ""): row[c] for c in edited_df.columns if c.startswith("wf_")
-    }
-    profiles[row["unit"]] = {
-        "num_employees": int(row["num_employees"]),
-        "employment_rate": float(row["employment_rate"]),
-        "office": float(row["office"]),
-        "meeting": float(row["meeting"]),
-        "not_office": float(row["not_office"]),
-        "week_factor": normalize_dict(wf_cols),
-    }
 
 # Week Scale
 st.sidebar.subheader("Week Scale")
