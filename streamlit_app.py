@@ -179,7 +179,9 @@ seed = 42
 min_bg = st.sidebar.slider("Min BG", 0.0, 1.0, 0.4, 0.1)
 max_bg = st.sidebar.slider("Max BG", 0.0, 1.0, 1.0, 0.1)
 step_bg = st.sidebar.slider("Step BG", 0.01, 0.2, 0.1, 0.01)
-# tolerance = st.sidebar.slider("Employment Rate Tolerance", 0.0, 0.2, 0.05, 0.01)
+tolerance = (
+    0.05  # = st.sidebar.slider("Employment Rate Tolerance", 0.0, 0.2, 0.05, 0.01)
+)
 weeks_not_working = st.sidebar.slider("Weeks Not Working", 0, 12, 7)
 min_cleardesk_hours = st.sidebar.slider("Cleardesk Hours", 0.5, 4.0, 2.0, 0.5)
 sharing_factor = st.sidebar.slider("Sharing Ratio", 0.0, 1.0, 0.8, 0.05)
