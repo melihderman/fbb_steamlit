@@ -156,7 +156,6 @@ default_meeting_start_time_dist = {
 }
 default_meeting_room_max_size = {"klein": 4, "mittel": 8, "gross": 16}
 
-
 # ---------------------------
 # Helpers
 # ---------------------------
