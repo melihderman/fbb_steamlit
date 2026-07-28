@@ -1,4 +1,4 @@
-# file: numpy_optimized_simulation.py
+# file: fbb_simulation.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,7 +41,6 @@ DAY_CODES = np.array(["mon", "tue", "wed", "thu", "fri"], dtype=object)
 SLOTS_AM = np.arange(8.0, 12.5, 0.5)
 SLOTS_PM = np.arange(12.5, 17.0, 0.5)
 TIMES_DAY = np.concatenate([SLOTS_AM, SLOTS_PM])
-SHARING_FACTOR = 0.8
 CUT_OFF_QUANTILE = 0.2  # (ohne die 20% tiefsten Peaks)
 
 # -------------------------------------------------
@@ -427,6 +426,13 @@ def _assign_meetings_numpy(
     meeting_records: List[List[object]],
     meetings: np.ndarray,  # (M,5)
 ) -> Tuple[int, List[List[object]]]:
+    """
+    Weist jedes Meeting aus `meetings` zufällig anwesenden, noch nicht verplanten
+    Mitarbeitenden zu (die für die volle Meetingdauer verfügbar sind) und trägt es
+    in `meeting`/`meeting_id` sowie `meeting_records` ein. Reicht die Anzahl
+    verfügbarer Mitarbeitender nicht für die volle Teilnehmerzahl, wird das Meeting
+    mit weniger Teilnehmenden durchgeführt.
+    """
     if meetings.size == 0:
         return next_meeting_id, meeting_records
 
@@ -704,7 +710,6 @@ def build_room_occupancy_slots(
     grp_sorted = grp_codes[order]
     s_sorted = s_idx[order]
     e_sorted = e_idx[order]
-    # mid_sorted = df["meeting_id"].to_numpy()[order]
 
     # boundaries of groups in sorted order
     bounds = np.flatnonzero(np.r_[True, grp_sorted[1:] != grp_sorted[:-1], True])
@@ -847,12 +852,19 @@ def run_simulation(
     meeting_size_dist: Mapping[int, float] | None = None,
     meeting_duration_dist: Mapping[float, float] | None = None,
     meeting_start_time_dist: Mapping[float, float] | None = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    return_slot_totals: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame] | Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Speicher-sparende Simulation.
     Rückgabe:
       - peaks_df: pro (replication, weekNumber, date) der Tagespeak der benötigten Einzel-APs über ALLE Units.
       - all_meetings: unverändert für Raumbelegung.
+      - slot_totals_df (nur wenn return_slot_totals=True): über alle Units aggregierte
+        Einzel-AP-Nachfrage je (replication, weekNumber, date, time_idx, time_float),
+        getrennt nach 'einzel_ap' (Sharing-Pool-Nachfrage) und 'einzel_ap_fixed'
+        (tatsächliche Präsenz-Nachfrage der zugewiesenen/fixen Arbeitsplätze).
+        Grössenordnung ~ Iterationen × Tage × Slots/Tag, unabhängig von der Mitarbeiterzahl
+        (kein Per-Mitarbeitenden-Detail, dafür siehe run_simulation_alldata).
     """
     rng = np.random.default_rng(seed)
 
@@ -889,6 +901,7 @@ def run_simulation(
     min_cleardesk_slots = int(round(min_cleardesk_hours / SLOT_LEN_HOURS))
 
     peaks_list: List[pd.DataFrame] = []
+    slot_totals_list: List[pd.DataFrame] = []
 
     for it in range(iterations):
         # Slot-Summen über ALLE Units dieser Iteration aufsummieren
@@ -896,6 +909,9 @@ def run_simulation(
 
         for unit, profile in profiles.items():
             num_employees = int(profile["num_employees"])
+            num_fixed_employees = max(
+                0, min(int(profile.get("num_fixed_employees", 0)), num_employees)
+            )
             target_rate = float(profile["employment_rate"])
             office_share = float(profile["office"])
             meeting_ratio_center = float(profile["meeting"])
@@ -1030,7 +1046,12 @@ def run_simulation(
             einzel_ap = (einzel_ap & (1 - cleardesk)).astype(np.int8)
 
             # ---- AGGREGATION je Unit: über Mitarbeitende summieren → (D,S)
-            einzel_sum = einzel_ap.sum(axis=0)  # (D,S)
+            # Mitarbeitende mit fixem Arbeitsplatz belegen keinen Sharing-Desk,
+            # zählen also nicht in den Tagespeak der Einzel-APs (Meetings weiterhin oben berücksichtigt)
+            einzel_sum = einzel_ap[: E - num_fixed_employees].sum(axis=0)  # (D,S)
+            # Tatsächliche Präsenz-Nachfrage der zugewiesenen (fixen) Arbeitsplätze,
+            # separat für die Risikokennwerte (dort fliesst Zugewiesen als eigenes Angebot ein)
+            einzel_sum_fixed = einzel_ap[E - num_fixed_employees :].sum(axis=0)  # (D,S)
 
             # Flach machen ⇒ je (date, time_idx) ein Zähler
             df_unit = pd.DataFrame(
@@ -1044,6 +1065,7 @@ def run_simulation(
                         np.tile(np.arange(SLOTS_PER_DAY), D)
                     ].astype(np.float32),
                     "einzel_ap": einzel_sum.reshape(-1).astype(np.int32),
+                    "einzel_ap_fixed": einzel_sum_fixed.reshape(-1).astype(np.int32),
                 }
             )
             slot_totals_it.append(df_unit)
@@ -1053,7 +1075,7 @@ def run_simulation(
             slots_all = pd.concat(slot_totals_it, ignore_index=True)
             slots_all = slots_all.groupby(
                 ["date", "weekNumber", "time_idx", "time_float"], as_index=False
-            )["einzel_ap"].sum()
+            )[["einzel_ap", "einzel_ap_fixed"]].sum()
             peaks_it = (
                 slots_all.groupby(["date", "weekNumber"], as_index=False)["einzel_ap"]
                 .max()
@@ -1061,6 +1083,11 @@ def run_simulation(
             )
             peaks_it.insert(0, "replication", np.int16(it))
             peaks_list.append(peaks_it)
+
+            if return_slot_totals:
+                slots_all_it = slots_all.copy()
+                slots_all_it.insert(0, "replication", np.int16(it))
+                slot_totals_list.append(slots_all_it)
 
     # Endgültige Peaks-Tabelle
     peaks_df = (
@@ -1070,7 +1097,7 @@ def run_simulation(
             columns=["replication", "date", "weekNumber", "daily_peak_einzel_ap"]
         )
     )
-    # all_meetings bauen & Raumgrößen mappen (unverändert)
+    # all_meetings bauen & Raumgrössen mappen (unverändert)
     all_meetings = pd.DataFrame(
         all_meeting_records,
         columns=[
@@ -1092,6 +1119,24 @@ def run_simulation(
             all_meetings, meeting_room_max_size
         )
 
+    if return_slot_totals:
+        slot_totals_df = (
+            pd.concat(slot_totals_list, ignore_index=True)
+            if slot_totals_list
+            else pd.DataFrame(
+                columns=[
+                    "replication",
+                    "date",
+                    "weekNumber",
+                    "time_idx",
+                    "time_float",
+                    "einzel_ap",
+                    "einzel_ap_fixed",
+                ]
+            )
+        )
+        return peaks_df, all_meetings, slot_totals_df
+
     return peaks_df, all_meetings
 
 
@@ -1099,7 +1144,6 @@ def run_simulation_alldata(
     *,
     start_date: date,
     end_date: date,
-    # week_factor: Dict[str, float],
     profiles: Dict[str, Dict[str, float]],
     min_bg: float = 0.4,
     max_bg: float = 1.0,
@@ -1115,13 +1159,14 @@ def run_simulation_alldata(
     meeting_duration_dist: Mapping[float, float] = None,
     meeting_start_time_dist: Mapping[float, float] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Run full simulation in NumPy; create pandas DataFrames once at the end."""
+    """
+    Vollständige Simulation mit Ausgabe auf Mitarbeitenden-Ebene (ein Slot-Datensatz
+    pro Mitarbeitendem/Tag/Zeitslot). Deutlich speicherintensiver als `run_simulation`
+    (Grössenordnung Iterationen × Mitarbeitende × Tage × Slots) - nur verwenden, wenn
+    tatsächlich Per-Mitarbeitenden-Detail benötigt wird (z.B. für explorative Checks
+    in den Notebooks).
+    """
     rng = np.random.default_rng(seed)
-
-    # # Calendar & categories
-    # cal, _, _, _, halfdays, halfday_probs = prepare_calendar(
-    #     start_date, end_date, week_factor
-    # )
 
     # Week weights from mapping (normalize over weeks present)
     weeks = pd.date_range(start=start_date, end=end_date, freq="W-MON")
@@ -1418,13 +1463,16 @@ def run_simulation_alldata(
 # -------------------------------------------------
 
 
-def plot_tagespeak(
+def _tagespeak_series(
     df: pd.DataFrame,
-    total_employees: int,
     cut_off_quantile: float = CUT_OFF_QUANTILE,
-    sharing_factor: float = SHARING_FACTOR,
-):
+    num_fixed_employees: int = 0,
+) -> Tuple[pd.Series, pd.Series]:
     """
+    Liefert (daily_peaks, avg_peaks_per_rep) für Einzelarbeitsplätze.
+    Fixe Arbeitsplätze sind permanent reserviert (unabhängig von Anwesenheit)
+    und zählen daher zu jedem Tagespeak dazu.
+
     Wenn df Spalte 'time_float' enthält → altes Format (slotbasiert).
     Sonst wird 'df' als Peak-Tabelle mit Spalte 'daily_peak_einzel_ap' erwartet.
     """
@@ -1446,6 +1494,8 @@ def plot_tagespeak(
             "daily_peak_einzel_ap"
         ]
 
+    daily_peaks = daily_peaks + num_fixed_employees
+
     # Untere Quantile abschneiden
     daily_peaks = daily_peaks.groupby(["replication", "weekNumber"]).apply(
         lambda s: s[s >= s.quantile(cut_off_quantile)]
@@ -1455,13 +1505,50 @@ def plot_tagespeak(
         ["replication", "weekNumber"]
     ).mean()  # Durchschnittlicher Tagespeak je Replication
 
+    return daily_peaks, avg_peaks_per_rep
+
+
+def compute_tagespeak_stats(
+    df: pd.DataFrame,
+    cut_off_quantile: float = CUT_OFF_QUANTILE,
+    num_fixed_employees: int = 0,
+) -> dict:
+    """
+    Kennzahlen für Einzelarbeitsplätze, ohne Plot:
+      - max_daily_peak: Absoluter Jahrespeak (höchster Tagespeak über alle Replikationen)
+      - max_avg_peak: Max. Ø-Tagespeak (höchster replikationsweiter Durchschnitts-Tagespeak)
+      - mean_avg_peak: Median durchschnittlicher Tagespeak
+    """
+    daily_peaks, avg_peaks_per_rep = _tagespeak_series(
+        df, cut_off_quantile=cut_off_quantile, num_fixed_employees=num_fixed_employees
+    )
+    return {
+        "max_daily_peak": float(daily_peaks.max()),
+        "max_avg_peak": float(avg_peaks_per_rep.max()),
+        "mean_avg_peak": float(avg_peaks_per_rep.median()),
+    }
+
+
+def plot_tagespeak(
+    df: pd.DataFrame,
+    cut_off_quantile: float = CUT_OFF_QUANTILE,
+    num_fixed_employees: int = 0,
+):
+    """
+    Balkendiagramm der Einzel-AP-Tagespeaks je Abdeckungsquantil (5%..100%),
+    mit Referenzlinien für maximalen, max. durchschnittlichen und median
+    durchschnittlichen Tagespeak. Siehe `compute_tagespeak_stats` für die
+    reinen Kennzahlen ohne Plot.
+    """
+    daily_peaks, avg_peaks_per_rep = _tagespeak_series(
+        df, cut_off_quantile=cut_off_quantile, num_fixed_employees=num_fixed_employees
+    )
+
     # 3. Quantile (100% .. 5%)
     quantile_levels = np.arange(0.0, 1.0, 0.05) + 0.05
     quantiles = np.quantile(avg_peaks_per_rep, q=quantile_levels)
 
     # 4. Zusatzlinien
-    # Anzahl StandardAP bzw. EinzelAp mit Sharing-Faktor
-    total_standap = total_employees * sharing_factor
     max_daily_peak = daily_peaks.max()
     max_avg_peak = avg_peaks_per_rep.max()
     mean_avg_peak = avg_peaks_per_rep.median()
@@ -1484,12 +1571,6 @@ def plot_tagespeak(
             va="bottom",
         )
 
-    ax.axhline(
-        total_standap,
-        color="#fa0505",
-        linewidth=2,
-        label=f"Anzahl StandardAP bzw. EinzelAP mit Sharing-Ratio {sharing_factor}",
-    )
     ax.axhline(
         max_daily_peak, color="#fa7f05", linewidth=2, label="Maximaler Tagespeak"
     )
@@ -1518,24 +1599,15 @@ def plot_tagespeak(
     return fig
 
 
-def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
-    """Visualisierung wie im Beispielbild: Anzahl Meetingräume (klein/mittel/gross)."""
+def _meetingroom_series(
+    all_meetingrooms: pd.DataFrame, size: str
+) -> Tuple[pd.Series, pd.Series]:
+    """Liefert (daily_peaks, avg_peaks_per_rep) der Raumbelegung für eine Grössenklasse."""
     df = all_meetingrooms[all_meetingrooms["meeting_room_size"] == size]
     if df.empty:
-        print(f"Keine Daten für {size} Meetingräume.")
-        return
+        empty = pd.Series(dtype=float)
+        return empty, empty
 
-    # group = (
-    #     df.groupby(["replication", "date", "time_float"])["busy"]
-    #     .sum()
-    #     .groupby(["replication", "date"])
-    # )
-
-    # # 1. Tagespeak je Replication & Datum & Slot
-    # daily_peaks = group.max()  # Tagespeak je Replication & Datum
-
-    # # 2. Durchschnittlicher Tagespeak pro Simulation
-    # avg_peaks_per_rep = group.mean()  # Durchschnittlicher Tagespeak je Replication
     group = (
         df.groupby(["replication", "weekNumber", "date", "time_float"])["busy"]
         .sum()
@@ -1549,6 +1621,149 @@ def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
     avg_peaks_per_rep = daily_peaks.groupby(
         ["replication", "weekNumber"]
     ).mean()  # Durchschnittlicher Tagespeak je Replication
+
+    return daily_peaks, avg_peaks_per_rep
+
+
+def compute_meetingroom_stats(all_meetingrooms: pd.DataFrame, size: str) -> dict:
+    """
+    Kennzahlen für Meetingräume einer Grössenklasse, ohne Plot:
+      - max_daily_peak: Maximaler Tagespeak
+      - max_avg_peak: Max. durchschnittlicher Tagespeak
+      - mean_avg_peak: Durchschnittlicher Tagespeak (Mittel über Replikationen)
+    """
+    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetingrooms, size)
+    if daily_peaks.empty:
+        return {"max_daily_peak": 0.0, "max_avg_peak": 0.0, "mean_avg_peak": 0.0}
+    return {
+        "max_daily_peak": float(daily_peaks.max()),
+        "max_avg_peak": float(avg_peaks_per_rep.max()),
+        "mean_avg_peak": float(avg_peaks_per_rep.mean()),
+    }
+
+
+def _daily_ap_shortfall_shares(
+    slot_totals_df: pd.DataFrame,
+    shared_ap: float,
+    zugewiesen_ap: float,
+    arbeitsmoeglichkeiten: float,
+) -> pd.DataFrame:
+    """
+    Pro (replication, weekNumber, date): Anteil der Standard-AP-Bedarfsstunden
+    (Sharing-Pool + zugewiesene/fixe Arbeitsplätze zusammen), der nicht durch das
+    Standard-AP-Angebot (Shared + Zugewiesen) gedeckt ist - aufgeteilt in 'noch
+    durch eine Arbeitsmöglichkeit gedeckt' und 'auch das nicht' (→ nur Sekundär-AP
+    verfügbar).
+    """
+    demand = (
+        slot_totals_df["einzel_ap"].to_numpy(dtype=float)
+        + slot_totals_df["einzel_ap_fixed"].to_numpy(dtype=float)
+    )
+    standard_supply = shared_ap + zugewiesen_ap
+    shortfall_standard = np.clip(demand - standard_supply, 0.0, None)
+    covered_arbeitsmoeglichkeit = np.minimum(shortfall_standard, arbeitsmoeglichkeiten)
+    shortfall_sekundaer = np.clip(shortfall_standard - arbeitsmoeglichkeiten, 0.0, None)
+
+    df = slot_totals_df[["replication", "weekNumber", "date"]].copy()
+    df["ph_bedarf"] = demand * SLOT_LEN_HOURS
+    df["ph_mit_arbeitsmoeglichkeit"] = covered_arbeitsmoeglichkeit * SLOT_LEN_HOURS
+    df["ph_mit_sekundaer"] = shortfall_sekundaer * SLOT_LEN_HOURS
+
+    daily = df.groupby(["replication", "weekNumber", "date"], as_index=False)[
+        ["ph_bedarf", "ph_mit_arbeitsmoeglichkeit", "ph_mit_sekundaer"]
+    ].sum()
+    daily["share_arbeitsmoeglichkeit"] = np.where(
+        daily["ph_bedarf"] > 0,
+        daily["ph_mit_arbeitsmoeglichkeit"] / daily["ph_bedarf"],
+        0.0,
+    )
+    daily["share_sekundaer"] = np.where(
+        daily["ph_bedarf"] > 0,
+        daily["ph_mit_sekundaer"] / daily["ph_bedarf"],
+        0.0,
+    )
+    return daily
+
+
+def _avg_days_over_threshold(
+    daily: pd.DataFrame, share_col: str, threshold: float, n_reps: int
+) -> float:
+    """Ø Anzahl Tage pro Replikation, an denen share_col > threshold liegt (0 für unbeteiligte Reps)."""
+    if n_reps <= 0:
+        return 0.0
+    flagged = daily.loc[daily[share_col] > threshold].groupby("replication").size()
+    return float(flagged.reindex(range(n_reps), fill_value=0).mean())
+
+
+def compute_reserve_am_jahrespeak(
+    absoluter_jahrespeak: float,
+    shared_ap: float,
+    zugewiesen_ap: float,
+    arbeitsmoeglichkeiten: float,
+    sekundaer_ap: float,
+) -> float:
+    """
+    Risikokennwert 1 - Verbleibende freie Einzel-APs bei absolutem Jahrespeak:
+    Alle Einzelarbeitsplätze (Standard = Shared + Zugewiesen, Arbeitsmöglichkeiten,
+    Sekundär) abzüglich des absoluten Belegungs-Jahrespeaks.
+    Positiv = Reserve, negativ = Überlastung.
+    """
+    total_available = shared_ap + zugewiesen_ap + arbeitsmoeglichkeiten + sekundaer_ap
+    return float(total_available - absoluter_jahrespeak)
+
+
+def compute_tage_ohne_standard_mit_arbeitsmoeglichkeit(
+    slot_totals_df: pd.DataFrame,
+    shared_ap: float,
+    zugewiesen_ap: float,
+    arbeitsmoeglichkeiten: float,
+    threshold: float = 0.02,
+) -> float:
+    """
+    Risikokennwert 2 - Personenstunden ohne Standard-AP, aber mit Arbeitsmöglichkeit:
+    Anzahl Tage pro Jahr (Ø über Replikationen) mit nennenswerter Einschränkung,
+    d.h. an denen > threshold (Standard 2%) der Standard-AP-Bedarfsstunden dieses
+    Tages (Sharing-Pool + Zugewiesen) keinen Standard-AP, aber eine
+    Arbeitsmöglichkeit zur Verfügung haben.
+    """
+    if slot_totals_df.empty:
+        return 0.0
+    daily = _daily_ap_shortfall_shares(
+        slot_totals_df, shared_ap, zugewiesen_ap, arbeitsmoeglichkeiten
+    )
+    n_reps = int(slot_totals_df["replication"].nunique())
+    return _avg_days_over_threshold(daily, "share_arbeitsmoeglichkeit", threshold, n_reps)
+
+
+def compute_tage_ohne_standard_und_arbeitsmoeglichkeit(
+    slot_totals_df: pd.DataFrame,
+    shared_ap: float,
+    zugewiesen_ap: float,
+    arbeitsmoeglichkeiten: float,
+    threshold: float = 0.02,
+) -> float:
+    """
+    Risikokennwert 3 - Personenstunden ohne Alternative zur Nutzung eines Sekundär-APs:
+    Anzahl Tage pro Jahr (Ø über Replikationen) mit nennenswerter Einschränkung,
+    d.h. an denen > threshold (Standard 2%) der Standard-AP-Bedarfsstunden dieses Tages
+    weder Standard-AP noch Arbeitsmöglichkeit, sondern nur einen Sekundär-AP zur
+    Verfügung haben.
+    """
+    if slot_totals_df.empty:
+        return 0.0
+    daily = _daily_ap_shortfall_shares(
+        slot_totals_df, shared_ap, zugewiesen_ap, arbeitsmoeglichkeiten
+    )
+    n_reps = int(slot_totals_df["replication"].nunique())
+    return _avg_days_over_threshold(daily, "share_sekundaer", threshold, n_reps)
+
+
+def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
+    """Visualisierung wie im Beispielbild: Anzahl Meetingräume (klein/mittel/gross)."""
+    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetingrooms, size)
+    if daily_peaks.empty:
+        print(f"Keine Daten für {size} Meetingräume.")
+        return
 
     # 3. Quantile (100% .. 5%) runden auf 2 stellige Zahl
     quantile_levels = np.arange(0.0, 1.0, 0.05) + 0.05
@@ -1686,29 +1901,29 @@ if __name__ == "__main__":
     profiles = {
         "Abteilung_A": {
             "num_employees": 40,
+            "num_fixed_employees": 8,
             "employment_rate": 0.8,
             "office": 0.7,
             "meeting": 0.3,
             "not_office": 0.3,
-            # "assigned_workplace": 8,
             "week_factor": week_factor,
         },
         "Team_B": {
             "num_employees": 30,
+            "num_fixed_employees": 6,
             "employment_rate": 0.75,
             "office": 0.6,
             "meeting": 0.25,
             "not_office": 0.4,
-            # "assigned_workplace": 6,
             "week_factor": week_factor,
         },
         "Funktion_C": {
             "num_employees": 30,
+            "num_fixed_employees": 10,
             "employment_rate": 0.85,
             "office": 0.8,
             "meeting": 0.4,
             "not_office": 0.2,
-            # "assigned_workplace": 10,
             "week_factor": week_factor,
         },
     }
@@ -1762,7 +1977,6 @@ if __name__ == "__main__":
     all_data, all_meetings = run_simulation(
         start_date=start_date,
         end_date=end_date,
-        # week_factor=week_factor,
         profiles=profiles,
         min_bg=0.4,
         max_bg=1.0,
@@ -1780,6 +1994,9 @@ if __name__ == "__main__":
     )
     # anzahl zeilen in all_data
     print(f"Anzahl Zeilen im Ergebnis-Datensatz: {len(all_data)}")
+    # anzahl meetings in all_meetings
+    print(f"Anzahl Meetings im Ergebnis-Datensatz: {len(all_meetings)}")
+    # Meetingraum-Auslastung berechnen
 
     all_meetingrooms = build_room_occupancy_slots(
         all_meetings,
@@ -1789,69 +2006,13 @@ if __name__ == "__main__":
         include_idle=True,
     )
 
-    # Anzahl Mitarbeiter aus Profilen
-    total_employees = sum(profile["num_employees"] for profile in profiles.values())
-    plot_tagespeak(all_data, total_employees).show()
+    # Anzahl fixer Arbeitsplätze aus Profilen (für die Tagespeak-Referenzlinien)
+    total_fixed_employees = sum(
+        profile.get("num_fixed_employees", 0) for profile in profiles.values()
+    )
+    plot_tagespeak(all_data, num_fixed_employees=total_fixed_employees).show()
     plot_meetingrooms(all_meetingrooms, "klein").show()
     plot_meetingrooms(all_meetingrooms, "mittel").show()
     plot_meetingrooms(all_meetingrooms, "gross").show()
-
-    # print("\nBG pro Einheit:")
-    # bg_rep_mean = all_data.groupby(["replication", "unit"], observed=False)["bg"].mean()
-    # bg_mean = bg_rep_mean.groupby("unit", observed=False).mean()
-    # bg_std = bg_rep_mean.groupby("unit", observed=False).std()
-    # for unit, profile in profiles.items():
-    #     target_rate = float(profile["employment_rate"])
-    #     print(
-    #         f"{unit}: {bg_mean[unit]:.3f} (+/-{bg_std[unit]:.3f}) (target: {target_rate:.3f})"
-    #     )
-
-    # print("\nAnteil Office pro Einheit:")
-    # office_sum = all_data.groupby(["replication", "unit"], observed=False)[
-    #     "present"
-    # ].sum()
-    # office_share_mean = office_sum.groupby("unit", observed=False).mean()
-    # office_share_std = office_sum.groupby("unit", observed=False).std()
-    # for unit, profile in profiles.items():
-    #     num_employees = int(profile["num_employees"])
-    #     total_slots = (
-    #         num_employees * 5 * 45 * SLOTS_PER_DAY * (profile["employment_rate"])
-    #     )  # approx
-    #     share = office_share_mean[unit] / total_slots if total_slots > 0 else 0.0
-    #     std = office_share_std[unit] / total_slots if total_slots > 0 else 0.0
-    #     print(f"{unit}: {share:.3f} (+/-{std:.3f}) (target: {profile['office']:.3f})")
-
-    # print("\nMeeting Rate pro Einheit:")
-    # meeting_sum = all_data.groupby(["replication", "unit"], observed=False)[
-    #     "meeting"
-    # ].sum()
-    # meeting_sum_mean = meeting_sum.groupby("unit", observed=False).mean()
-    # meeting_sum_std = meeting_sum.groupby("unit", observed=False).std()
-    # for unit, profile in profiles.items():
-    #     denom = office_share_mean[unit] if office_share_mean[unit] > 0 else 1.0
-    #     share_mean = meeting_sum_mean[unit] / denom
-    #     share_std = meeting_sum_std[unit] / denom
-    #     print(
-    #         f"{unit}: {share_mean:.3f} (+/-{share_std:.3f}) (target: {profile['meeting']:.3f})"
-    #     )
-
-    # print("\nWochentagsverteilung Präsenz (in %):")
-    # present_by_dow = all_data.groupby("weekday", observed=False)["present"].sum()
-    # total_present = present_by_dow.sum()
-    # present_pct = (present_by_dow / total_present * 100).round(2)
-    # for d in DAY_CODES:
-    #     target_pct = week_factor[d] * 100
-    #     actual_pct = present_pct.get(d, 0.0)
-    #     print(f"{d}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
-
-    # print("\nVerteilung auf Wochen (in %):")
-    # present_by_week = all_data.groupby("weekNumber", observed=False)["present"].sum()
-    # total_present = present_by_week.sum()
-    # present_pct = (present_by_week / total_present * 100).round(2)
-    # for week, weight in sorted(week_weighting.items()):
-    #     w = int(week)
-    #     target_pct = weight / sum(week_weighting.values()) * 100
-    #     actual_pct = present_pct.get(w, 0.0)
-    #     print(f"Woche {w}: {actual_pct:.2f}% (target: {target_pct:.2f}%)")
 
     input("\nFertig. Enter zum Beenden...")

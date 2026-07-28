@@ -10,6 +10,11 @@ from fbb_simulation import (
     TIMES_DAY,
     plot_tagespeak,
     plot_meetingrooms,
+    compute_tagespeak_stats,
+    compute_meetingroom_stats,
+    compute_reserve_am_jahrespeak,
+    compute_tage_ohne_standard_mit_arbeitsmoeglichkeit,
+    compute_tage_ohne_standard_und_arbeitsmoeglichkeit,
     build_week_weighting_from_weeks,
     scale_week_weighting,
 )
@@ -87,6 +92,7 @@ default_week_scale = {
 default_profiles = {
     "Abteilung_A": {
         "num_employees": 40,
+        "num_fixed_employees": 0,
         "employment_rate": 0.8,
         "office": 0.7,
         "meeting": 0.3,
@@ -95,6 +101,7 @@ default_profiles = {
     },
     "Team_B": {
         "num_employees": 30,
+        "num_fixed_employees": 0,
         "employment_rate": 0.75,
         "office": 0.6,
         "meeting": 0.25,
@@ -103,6 +110,7 @@ default_profiles = {
     },
     "Funktion_C": {
         "num_employees": 30,
+        "num_fixed_employees": 0,
         "employment_rate": 0.85,
         "office": 0.8,
         "meeting": 0.4,
@@ -160,14 +168,10 @@ default_meeting_room_max_size = {"klein": 4, "mittel": 8, "gross": 16}
 # Helpers
 # ---------------------------
 def normalize_dict(d: dict) -> dict:
+    """Skaliert die Werte eines dict so, dass sie sich zu 1 aufsummieren."""
+
     s = sum(d.values())
     return {k: v / s for k, v in d.items()} if s > 0 else d
-
-
-# Hash-Funktionen für Cache (NumPy/Dict)
-def _hashable_mapping(m: dict) -> tuple:
-    return tuple(sorted(m.items()))
-
 
 # ---------------------------
 # Sidebar
@@ -183,7 +187,6 @@ tolerance = (
 )
 weeks_not_working = st.sidebar.slider("Weeks Not Working", 0, 12, 7)
 min_cleardesk_hours = st.sidebar.slider("Cleardesk Hours", 0.5, 4.0, 2.0, 0.5)
-sharing_factor = st.sidebar.slider("Sharing Ratio", 0.0, 1.0, 0.8, 0.05)
 cut_off_quantile = st.sidebar.slider("Cut-off Quantile", 0.0, 0.5, 0.2, 0.05)
 
 # Profiles
@@ -203,8 +206,11 @@ for _, row in edited_df.iterrows():
     wf_cols = {
         c.replace("wf_", ""): row[c] for c in edited_df.columns if c.startswith("wf_")
     }
+    raw_num_fixed = row.get("num_fixed_employees", 0)
+    num_fixed_employees = int(raw_num_fixed) if pd.notna(raw_num_fixed) else 0
     profiles[row["unit"]] = {
         "num_employees": int(row["num_employees"]),
+        "num_fixed_employees": num_fixed_employees,
         "employment_rate": float(row["employment_rate"]),
         "office": float(row["office"]),
         "meeting": float(row["meeting"]),
@@ -280,7 +286,8 @@ def _cached_simulation(
     meeting_duration_dist,
     meeting_start_time_dist,
 ):
-    # Warum cache: teure Simulation, identische Inputs → Wiederverwendung
+    """Cache-Wrapper um run_simulation: teure Simulation, identische Inputs → Wiederverwendung."""
+
     return run_simulation(
         start_date=start_date,
         end_date=end_date,
@@ -298,11 +305,14 @@ def _cached_simulation(
         meeting_size_dist=meeting_size_dist,
         meeting_duration_dist=meeting_duration_dist,
         meeting_start_time_dist=meeting_start_time_dist,
+        return_slot_totals=True,
     )
 
 
 @st.cache_data(show_spinner=False)
 def _cached_room_occupancy(all_meetings):
+    """Cache-Wrapper um build_room_occupancy_slots für die Meetingraum-Belegung."""
+
     return build_room_occupancy_slots(
         all_meetings,
         slot_times=TIMES_DAY,
@@ -335,7 +345,7 @@ if st.sidebar.button("Run Simulation"):
                 week_weighting = {k: v / s for k, v in week_weighting.items()}
 
             st.write("🧮 Starte Simulation …")
-            all_data, all_meetings = _cached_simulation(
+            all_data, all_meetings, slot_totals = _cached_simulation(
                 default_start_date,
                 default_end_date,
                 profiles,
@@ -359,28 +369,187 @@ if st.sidebar.button("Run Simulation"):
 
             status.update(label="Fertig ✅", state="complete")
 
-        st.success("Simulation complete!")
-
-        # ---------------------------
-        # Visualizations
-        # ---------------------------
-        st.subheader("📊 Einzelarbeitsplätze – Tagespeak")
-        total_employees = sum(
-            int(profile["num_employees"]) for profile in profiles.values()
+        total_fixed_employees = sum(
+            int(profile.get("num_fixed_employees", 0)) for profile in profiles.values()
         )
-        fig1 = plot_tagespeak(
-            all_data, total_employees, cut_off_quantile, sharing_factor
-        )
-        st.pyplot(fig1, clear_figure=True)
 
-        st.subheader("📊 Meetingräume – Tagespeak")
-        for size in ["klein", "mittel", "gross"]:
-            st.markdown(f"### {size.capitalize()} Meetingräume")
-            fig2 = plot_meetingrooms(all_meetingrooms, size)
-            st.pyplot(fig2, clear_figure=True)
+        # Ergebnisse persistieren: Folge-Eingaben (Standardarbeitsplätze,
+        # Risikokennwerte) sollen ohne erneute (teure) Simulation reagieren.
+        st.session_state["sim_results"] = {
+            "all_data": all_data,
+            "all_meetings": all_meetings,
+            "all_meetingrooms": all_meetingrooms,
+            "slot_totals": slot_totals,
+            "total_fixed_employees": total_fixed_employees,
+        }
 
     except Exception as e:
         # Sichtbarer Fehler statt App-Abbruch
         st.error("Die Simulation ist fehlgeschlagen.")
         st.exception(e)
-        st.stop()
+        st.session_state.pop("sim_results", None)
+
+# ---------------------------
+# Ergebnisse (reagieren live auf Sidebar- und Folge-Eingaben,
+# ohne die Simulation neu laufen zu lassen)
+# ---------------------------
+if "sim_results" in st.session_state:
+    res = st.session_state["sim_results"]
+    all_data = res["all_data"]
+    all_meetingrooms = res["all_meetingrooms"]
+    slot_totals = res["slot_totals"]
+    total_fixed_employees = res["total_fixed_employees"]
+
+    st.success("Simulation complete!")
+
+    # ---------------------------
+    # Kennzahlen
+    # ---------------------------
+    tagespeak_stats = compute_tagespeak_stats(
+        all_data,
+        cut_off_quantile=cut_off_quantile,
+        num_fixed_employees=total_fixed_employees,
+    )
+
+    room_order = ["klein", "mittel", "gross"]
+    min_meeting_size = int(min(meeting_size_dist.keys())) if meeting_size_dist else 2
+    room_bounds = {}
+    prev_max = min_meeting_size - 1
+    for r in room_order:
+        cap = int(meeting_room_max_size.get(r, prev_max))
+        room_bounds[r] = (prev_max + 1, cap)
+        prev_max = cap
+    room_stats = {
+        size: compute_meetingroom_stats(all_meetingrooms, size) for size in room_order
+    }
+
+    st.subheader("Einzelarbeitsplätze")
+    col1, col2 = st.columns(2)
+    col1.metric("Absoluter Jahrespeak", f"{tagespeak_stats['max_daily_peak']:.0f}")
+    col2.metric("Max. Ø-Tagespeak", f"{tagespeak_stats['max_avg_peak']:.0f}")
+    with st.expander("Verteilung ansehen"):
+        fig1 = plot_tagespeak(
+            all_data,
+            cut_off_quantile,
+            total_fixed_employees,
+        )
+        st.pyplot(fig1, clear_figure=True)
+
+    st.subheader("Meetingräume")
+    cols = st.columns(len(room_order))
+    for col, size in zip(cols, room_order):
+        lo, hi = room_bounds[size]
+        col.metric(
+            f"{size.capitalize()} ({lo}–{hi} P)",
+            f"{room_stats[size]['max_avg_peak']:.0f}",
+        )
+    with st.expander("Verteilung ansehen"):
+        for size in room_order:
+            st.markdown(f"### {size.capitalize()} Meetingräume")
+            fig2 = plot_meetingrooms(all_meetingrooms, size)
+            st.pyplot(fig2, clear_figure=True)
+
+    # ---------------------------
+    # Standardarbeitsplätze (editierbare Folge-Eingaben nach der Simulation)
+    # ---------------------------
+    st.subheader("Standardarbeitsplätze")
+
+    def _ap_input_row(label, help_text, suggested_value, key, note=None):
+        """Zeigt Label + Simulationsvorschlag links und ein editierbares Zahlenfeld rechts an."""
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(f"**{label}**", help=help_text)
+            st.caption(f"Simulationsvorschlag: {suggested_value:.0f}")
+            if note:
+                st.caption(note)
+        with c2:
+            return c2.number_input(
+                label,
+                min_value=0,
+                value=int(round(suggested_value)),
+                key=key,
+                label_visibility="collapsed",
+            )
+
+    shared_ap = _ap_input_row(
+        "Shared",
+        "Anzahl geteilter Standardarbeitsplätze (Sharing-Pool). "
+        "Vorschlag aus dem Max. Ø-Tagespeak der Simulation.",
+        tagespeak_stats["max_avg_peak"],
+        "std_shared",
+    )
+    zugewiesen_ap = _ap_input_row(
+        "Zugewiesen",
+        "Anzahl fest zugewiesener (fixer) Arbeitsplätze, kein Sharing. "
+        "Vorschlag aus den Fix-AP-Angaben der Profile.",
+        total_fixed_employees,
+        "std_zugewiesen",
+    )
+    arbeitsmoeglichkeiten = _ap_input_row(
+        "Arbeitsmöglichkeiten",
+        "Zusätzliche flexible Arbeitsmöglichkeiten (z.B. Touchdown, Fokusräume, "
+        "Lounge) – nicht Teil der Simulation, manuell zu planen.",
+        0,
+        "std_arbeitsmoeglichkeiten",
+    )
+    sekundaer_ap = _ap_input_row(
+        "Sekundärarbeitsplätze",
+        "Arbeitsplätze in anderen Flächentypen (z.B. Cafeteria, Lounge) – "
+        "nicht Teil der Simulation, manuell zu planen.",
+        0,
+        "std_sekundaer",
+        note="m²-Bedarf in anderen Flächentypen enthalten",
+    )
+
+    # ---------------------------
+    # Risikokennwerte
+    # ---------------------------
+    st.subheader("Risikokennwerte")
+
+    reserve = compute_reserve_am_jahrespeak(
+        tagespeak_stats["max_daily_peak"],
+        shared_ap,
+        zugewiesen_ap,
+        arbeitsmoeglichkeiten,
+        sekundaer_ap,
+    )
+    tage_mit_arbeitsmoeglichkeit = compute_tage_ohne_standard_mit_arbeitsmoeglichkeit(
+        slot_totals, shared_ap, zugewiesen_ap, arbeitsmoeglichkeiten
+    )
+    tage_mit_sekundaer = compute_tage_ohne_standard_und_arbeitsmoeglichkeit(
+        slot_totals, shared_ap, zugewiesen_ap, arbeitsmoeglichkeiten
+    )
+
+    st.metric(
+        "Verbleibende freie Einzel-APs bei absolutem Jahrespeak",
+        f"{reserve:+.0f}",
+        help=(
+            "Alle Einzelarbeitsplätze (Standard, Arbeitsmöglichkeiten, Sekundär) "
+            "abzüglich des absoluten Belegungs-Jahrespeaks. "
+            "Positiv = Reserve, negativ = Überlastung."
+        ),
+    )
+    c1, c2 = st.columns(2)
+    c1.markdown(
+        "**Personenstunden ohne Standard-AP, aber mit Arbeitsmöglichkeit**",
+        help=(
+            "Anzahl Tage pro Jahr (Ø über Replikationen) mit nennenswerter "
+            "Einschränkung: an mehr als 2% der Einzel-AP-Bedarfsstunden dieses "
+            "Tages ist kein Standardarbeitsplatz, aber eine Arbeitsmöglichkeit "
+            "verfügbar."
+        ),
+    )
+    c1.caption("Anzahl Tage pro Jahr mit nennenswerter Einschränkung")
+    c1.metric(" ", f"{tage_mit_arbeitsmoeglichkeit:.0f}", label_visibility="collapsed")
+
+    c2.markdown(
+        "**Personenstunden ohne Alternative zur Nutzung eines Sekundär-APs**",
+        help=(
+            "Anzahl Tage pro Jahr (Ø über Replikationen) mit nennenswerter "
+            "Einschränkung: an mehr als 2% der Einzel-AP-Bedarfsstunden dieses "
+            "Tages ist weder ein Standardarbeitsplatz noch eine Arbeitsmöglichkeit, "
+            "aber ein Sekundärarbeitsplatz verfügbar."
+        ),
+    )
+    c2.caption("Anzahl Tage pro Jahr mit nennenswerter Einschränkung")
+    c2.metric(" ", f"{tage_mit_sekundaer:.0f}", label_visibility="collapsed")
