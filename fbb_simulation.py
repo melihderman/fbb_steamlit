@@ -418,7 +418,7 @@ def _assign_meetings_numpy(
     present: np.ndarray,  # (E,D,S) int8/bool
     meeting: np.ndarray,  # (E,D,S) int8
     meeting_id: np.ndarray,  # (E,D,S) int32
-    times_day: np.ndarray,  # (S,) float
+    time_to_idx: Dict[float, int],  # times_day -> slot index, gebaut vom Aufrufer
     unit: str,
     day_idx: int,
     date_ts: pd.Timestamp,
@@ -436,9 +436,10 @@ def _assign_meetings_numpy(
     if meetings.size == 0:
         return next_meeting_id, meeting_records
 
-    time_to_idx = {float(t): i for i, t in enumerate(times_day)}
-
-    for size, dur, ph, start, end in meetings:
+    # .tolist() einmalig: Iteration über native Python-Zahlen statt über
+    # NumPy-Zeilen/-Skalare je Meeting spart pro Aufruf spürbar Overhead
+    # (identisches Ergebnis, da unten ohnehin sofort wieder float()/int() folgt).
+    for size, dur, ph, start, end in meetings.tolist():
         s_idx = time_to_idx.get(float(start))
         e_idx = time_to_idx.get(float(end))
         if s_idx is None or e_idx is None:
@@ -447,12 +448,15 @@ def _assign_meetings_numpy(
         if need_slots <= 0:
             continue
 
-        window = present[:, day_idx, s_idx:e_idx].astype(bool) & (
-            meeting[:, day_idx, s_idx:e_idx] == 0
+        # present/meeting sind 0/1-Arrays (int8/bool): "present & (1-meeting)" ist
+        # elementweise identisch zu "present.astype(bool) & (meeting == 0)",
+        # spart aber eine Vergleichs- und eine Cast-Operation pro Meeting.
+        window = present[:, day_idx, s_idx:e_idx] & (
+            1 - meeting[:, day_idx, s_idx:e_idx]
         )
         if window.size == 0:
             continue
-        avail_full = window.sum(axis=1) == need_slots
+        avail_full = window.all(axis=1)
         emp_candidates = np.flatnonzero(avail_full)
         if emp_candidates.size == 0:
             continue
@@ -899,6 +903,9 @@ def run_simulation(
     all_meeting_records: List[List[object]] = []
     next_meeting_id = 0
     min_cleardesk_slots = int(round(min_cleardesk_hours / SLOT_LEN_HOURS))
+    # Zeitraster ändert sich nie zwischen Units/Tagen/Iterationen -> einmal bauen
+    # statt (wie zuvor) bei jedem Meeting-Zuweisungsaufruf neu
+    time_to_idx = {float(t): i for i, t in enumerate(TIMES_DAY)}
 
     peaks_list: List[pd.DataFrame] = []
     slot_totals_list: List[pd.DataFrame] = []
@@ -1029,7 +1036,7 @@ def run_simulation(
                     present_slots,
                     meeting,
                     meeting_id_arr,
-                    cal.times_day,
+                    time_to_idx,
                     unit,
                     day_idx,
                     dts,
@@ -1113,6 +1120,22 @@ def run_simulation(
             "end_time",
         ],
     )
+    if not all_meetings.empty:
+        # Rightsizing: alle Werte liegen auf einem groben 0.5h/Ganzzahl-Raster und
+        # sind in den kleineren Dtypes exakt darstellbar - reduziert den Speicher-
+        # bedarf von all_meetings deutlich, ohne einen einzigen Wert zu verändern.
+        all_meetings = all_meetings.astype(
+            {
+                "replication": "int16",
+                "meeting_id": "int32",
+                "weekNumber": "int16",
+                "size": "int16",
+                "duration": "float32",
+                "person_hours": "float32",
+                "start_time": "float32",
+                "end_time": "float32",
+            }
+        )
     if meeting_room_max_size and not all_meetings.empty:
         all_meetings["unit"] = all_meetings["unit"].astype("category")
         all_meetings["meeting_room_size"] = compute_meeting_room_size(
@@ -1197,6 +1220,7 @@ def run_simulation_alldata(
 
     all_meeting_records: List[List[object]] = []
     next_meeting_id = 0
+    time_to_idx = {float(t): i for i, t in enumerate(TIMES_DAY)}
 
     min_cleardesk_slots = int(round(min_cleardesk_hours / SLOT_LEN_HOURS))
 
@@ -1334,7 +1358,7 @@ def run_simulation_alldata(
                     present_slots,
                     meeting,
                     meeting_id_arr,
-                    cal.times_day,
+                    time_to_idx,
                     unit,
                     day_idx,
                     dts,
@@ -1600,24 +1624,32 @@ def plot_tagespeak(
 
 
 def _meetingroom_series(
-    all_meetingrooms: pd.DataFrame, size: str
+    all_meetings: pd.DataFrame, size: str
 ) -> Tuple[pd.Series, pd.Series]:
-    """Liefert (daily_peaks, avg_peaks_per_rep) der Raumbelegung für eine Grössenklasse."""
-    df = all_meetingrooms[all_meetingrooms["meeting_room_size"] == size]
-    if df.empty:
+    """
+    Liefert (daily_peaks, avg_peaks_per_rep) der benötigten Meetingräume für eine
+    Grössenklasse, direkt aus den Meeting-Rohdaten via `compute_required_rooms`
+    (vektorisierter Line-Sweep). Das Tagesmaximum der benötigten Räume entspricht
+    exakt dem, was eine Slot-für-Slot-Belegungstabelle liefern würde - hier aber
+    ohne diese (sehr grosse) Zwischentabelle je zu materialisieren.
+    """
+    if all_meetings.empty:
         empty = pd.Series(dtype=float)
         return empty, empty
 
-    group = (
-        df.groupby(["replication", "weekNumber", "date", "time_float"])["busy"]
-        .sum()
-        .groupby(["replication", "weekNumber", "date"])
+    required = compute_required_rooms(
+        all_meetings,
+        slot_times=TIMES_DAY,
+        by=("replication", "weekNumber", "date", "meeting_room_size"),
     )
+    sub = required[required["meeting_room_size"] == size]
+    if sub.empty:
+        empty = pd.Series(dtype=float)
+        return empty, empty
 
-    # 1. Tagespeak je Replication & Datum & Slot
-    daily_peaks = group.max()  # Tagespeak je Replication & Datum
-
-    # 2. Durchschnittlicher Tagespeak pro Simulation
+    daily_peaks = sub.set_index(["replication", "weekNumber", "date"])[
+        "required_rooms"
+    ]
     avg_peaks_per_rep = daily_peaks.groupby(
         ["replication", "weekNumber"]
     ).mean()  # Durchschnittlicher Tagespeak je Replication
@@ -1625,14 +1657,14 @@ def _meetingroom_series(
     return daily_peaks, avg_peaks_per_rep
 
 
-def compute_meetingroom_stats(all_meetingrooms: pd.DataFrame, size: str) -> dict:
+def compute_meetingroom_stats(all_meetings: pd.DataFrame, size: str) -> dict:
     """
     Kennzahlen für Meetingräume einer Grössenklasse, ohne Plot:
       - max_daily_peak: Maximaler Tagespeak
       - max_avg_peak: Max. durchschnittlicher Tagespeak
       - mean_avg_peak: Durchschnittlicher Tagespeak (Mittel über Replikationen)
     """
-    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetingrooms, size)
+    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetings, size)
     if daily_peaks.empty:
         return {"max_daily_peak": 0.0, "max_avg_peak": 0.0, "mean_avg_peak": 0.0}
     return {
@@ -1758,9 +1790,9 @@ def compute_tage_ohne_standard_und_arbeitsmoeglichkeit(
     return _avg_days_over_threshold(daily, "share_sekundaer", threshold, n_reps)
 
 
-def plot_meetingrooms(all_meetingrooms: pd.DataFrame, size: str):
+def plot_meetingrooms(all_meetings: pd.DataFrame, size: str):
     """Visualisierung wie im Beispielbild: Anzahl Meetingräume (klein/mittel/gross)."""
-    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetingrooms, size)
+    daily_peaks, avg_peaks_per_rep = _meetingroom_series(all_meetings, size)
     if daily_peaks.empty:
         print(f"Keine Daten für {size} Meetingräume.")
         return
@@ -1996,23 +2028,14 @@ if __name__ == "__main__":
     print(f"Anzahl Zeilen im Ergebnis-Datensatz: {len(all_data)}")
     # anzahl meetings in all_meetings
     print(f"Anzahl Meetings im Ergebnis-Datensatz: {len(all_meetings)}")
-    # Meetingraum-Auslastung berechnen
-
-    all_meetingrooms = build_room_occupancy_slots(
-        all_meetings,
-        slot_times=TIMES_DAY,
-        by=("replication", "weekNumber", "date", "meeting_room_size"),
-        room_col="room_id",
-        include_idle=True,
-    )
 
     # Anzahl fixer Arbeitsplätze aus Profilen (für die Tagespeak-Referenzlinien)
     total_fixed_employees = sum(
         profile.get("num_fixed_employees", 0) for profile in profiles.values()
     )
     plot_tagespeak(all_data, num_fixed_employees=total_fixed_employees).show()
-    plot_meetingrooms(all_meetingrooms, "klein").show()
-    plot_meetingrooms(all_meetingrooms, "mittel").show()
-    plot_meetingrooms(all_meetingrooms, "gross").show()
+    plot_meetingrooms(all_meetings, "klein").show()
+    plot_meetingrooms(all_meetings, "mittel").show()
+    plot_meetingrooms(all_meetings, "gross").show()
 
     input("\nFertig. Enter zum Beenden...")

@@ -6,8 +6,6 @@ from datetime import date
 # WICHTIG: aus deiner vorhandenen Datei importieren
 from fbb_simulation import (
     run_simulation,
-    build_room_occupancy_slots,
-    TIMES_DAY,
     plot_tagespeak,
     plot_meetingrooms,
     compute_tagespeak_stats,
@@ -309,19 +307,6 @@ def _cached_simulation(
     )
 
 
-@st.cache_data(show_spinner=False)
-def _cached_room_occupancy(all_meetings):
-    """Cache-Wrapper um build_room_occupancy_slots für die Meetingraum-Belegung."""
-
-    return build_room_occupancy_slots(
-        all_meetings,
-        slot_times=TIMES_DAY,
-        by=("replication", "weekNumber", "date", "meeting_room_size"),
-        room_col="room_id",
-        include_idle=True,
-    )
-
-
 # ---------------------------
 # Run Simulation Button
 # ---------------------------
@@ -364,9 +349,6 @@ if st.sidebar.button("Run Simulation"):
                 meeting_start_time_dist,
             )
 
-            st.write("🏗️ Erzeuge Room-Occupancy …")
-            all_meetingrooms = _cached_room_occupancy(all_meetings)
-
             status.update(label="Fertig ✅", state="complete")
 
         total_fixed_employees = sum(
@@ -378,7 +360,6 @@ if st.sidebar.button("Run Simulation"):
         st.session_state["sim_results"] = {
             "all_data": all_data,
             "all_meetings": all_meetings,
-            "all_meetingrooms": all_meetingrooms,
             "slot_totals": slot_totals,
             "total_fixed_employees": total_fixed_employees,
         }
@@ -396,7 +377,7 @@ if st.sidebar.button("Run Simulation"):
 if "sim_results" in st.session_state:
     res = st.session_state["sim_results"]
     all_data = res["all_data"]
-    all_meetingrooms = res["all_meetingrooms"]
+    all_meetings = res["all_meetings"]
     slot_totals = res["slot_totals"]
     total_fixed_employees = res["total_fixed_employees"]
 
@@ -420,7 +401,7 @@ if "sim_results" in st.session_state:
         room_bounds[r] = (prev_max + 1, cap)
         prev_max = cap
     room_stats = {
-        size: compute_meetingroom_stats(all_meetingrooms, size) for size in room_order
+        size: compute_meetingroom_stats(all_meetings, size) for size in room_order
     }
 
     st.subheader("Einzelarbeitsplätze")
@@ -446,7 +427,7 @@ if "sim_results" in st.session_state:
     with st.expander("Verteilung ansehen"):
         for size in room_order:
             st.markdown(f"### {size.capitalize()} Meetingräume")
-            fig2 = plot_meetingrooms(all_meetingrooms, size)
+            fig2 = plot_meetingrooms(all_meetings, size)
             st.pyplot(fig2, clear_figure=True)
 
     # ---------------------------
